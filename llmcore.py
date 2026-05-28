@@ -1,18 +1,20 @@
-import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid
+import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, importlib.util, uuid
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4())
 
 def _load_mykeys():
     global _mykey_path
-    try:
-        import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.py')
+    if os.path.exists(p):
+        _mykey_path = p
+        spec = importlib.util.spec_from_file_location(f'_ga_mykey_{os.getpid()}_{time.time_ns()}', p)
+        mykey = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mykey)
         return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
-    except ImportError: pass
     _mykey_path = p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
     if not os.path.exists(p): raise Exception('[ERROR] mykey.py or mykey.json not found, please create one from mykey_template.')
     with open(p, encoding='utf-8') as f: return json.load(f)
-
 _mykey_path = _mykey_mtime = None
 def reload_mykeys():
     global _mykey_mtime
@@ -206,13 +208,13 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
     """
     content_text = ""
     if api_mode == "responses":
-        seen_delta = False; fc_buf = {}; current_fc_idx = None
+        seen_delta = False; fc_buf = {}; current_fc_idx = None; completed = False; done_marker = False
         for line in resp_lines:
             if not line: continue
             line = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else line
             if not line.startswith("data:"): continue
             data_str = line[5:].lstrip()
-            if data_str == "[DONE]": break
+            if data_str == "[DONE]": done_marker = True; break
             try: evt = json.loads(data_str)
             except: continue
             etype = evt.get("type", "")
@@ -242,7 +244,10 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             elif etype == "response.completed":
                 usage = evt.get("response", {}).get("usage", {})
                 _record_usage(usage, api_mode)
+                completed = True
                 break
+        if not (completed or done_marker):
+            raise requests.ConnectionError("OpenAI responses stream ended before response.completed")
         blocks = []
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(fc_buf):
@@ -255,16 +260,17 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
         return blocks
     else:
         tc_buf = {}  # index -> {id, name, args}
-        reasoning_text = ""
+        reasoning_text = ""; done_marker = False; finish_reason = None
         for line in resp_lines:
             if not line: continue
             line = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else line
             if not line.startswith("data:"): continue
             data_str = line[5:].lstrip()
-            if data_str == "[DONE]": break
+            if data_str == "[DONE]": done_marker = True; break
             try: evt = json.loads(data_str)
             except: continue
             ch = (evt.get("choices") or [{}])[0]
+            finish_reason = ch.get("finish_reason") or finish_reason
             delta = ch.get("delta") or {}
             if delta.get("reasoning_content"):
                 reasoning_text += delta["reasoning_content"]
@@ -281,6 +287,8 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 if tc.get("id") and not tc_buf[idx]["id"]: tc_buf[idx]["id"] = tc["id"]
             usage = evt.get("usage")
             if usage: _record_usage(usage, api_mode)
+        if not (done_marker or finish_reason):
+            raise requests.ConnectionError("OpenAI chat stream ended before completion marker")
         blocks = []
         if reasoning_text: blocks.append({"type": "thinking", "thinking": reasoning_text})
         if content_text: blocks.append({"type": "text", "text": content_text})
@@ -350,42 +358,75 @@ def _stamp_oai_cache_markers(messages, model):
             c = list(c); c[-1] = dict(c[-1], cache_control={'type': 'ephemeral'})
             messages[idx] = {**messages[idx], 'content': c}
 
-def _stream_with_retry(sess, url, headers, payload, parse_fn):
+def _safe_url_label(url):
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        return f"{u.netloc}{u.path}"
+    except Exception:
+        return str(url).split("?", 1)[0][:120]
+
+def _blocks_are_error(blocks):
+    return isinstance(blocks, list) and len(blocks) == 1 and _is_retryable_llm_error(blocks[0].get("text", ""))
+
+def _is_retryable_llm_error(text):
+    text = str(text or "")
+    stripped = text.lstrip()
+    markers = (
+        "[!!! Stream interrupted:",
+        "[!!! 流异常中断",
+        "ChunkedEncodingError",
+        "Response ended prematurely",
+        "OpenAI responses stream ended before response.completed",
+        "OpenAI chat stream ended before completion marker",
+    )
+    return stripped.startswith(("!!!Error:", "[Error:")) or any(marker in text for marker in markers)
+
+def _stream_with_retry(sess, url, headers, payload, parse_fn, request_stream=None, emit_final_error=True):
     _RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
         return max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
+    req_stream = sess.stream if request_stream is None else request_stream
     for attempt in range(sess.max_retries + 1):
-        streamed = False
+        streamed = False; chunks = []
         try:
-            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
+            with requests.post(url, headers=headers, json=payload, stream=req_stream,
                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 if r.status_code >= 400:
                     if r.status_code in _RETRYABLE and attempt < sess.max_retries:
                         d = _delay(r, attempt)
-                        print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                        print(f"[LLM Retry] HTTP {r.status_code} from {_safe_url_label(url)}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
                         time.sleep(d); continue
                     try: body = r.text.strip()[:500]
                     except: body = ""
                     err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
-                    yield err; return [{"type": "text", "text": err}]
+                    if emit_final_error: yield err
+                    return [{"type": "text", "text": err}]
                 gen = parse_fn(r)
                 try:
-                    while True: streamed = True; yield next(gen)
+                    while True:
+                        chunk = next(gen)
+                        streamed = True
+                        chunks.append(chunk)
                 except StopIteration as e:
                     if not e.value and not streamed: raise requests.ConnectionError("empty response")
+                    for chunk in chunks: yield chunk
                     return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
             err = f"!!!Error: {type(e).__name__}"
             if attempt < sess.max_retries:
                 d = _delay(None, attempt)
-                print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                yield err; time.sleep(d); continue
-            yield err; return [{"type": "text", "text": err}]
+                print(f"[LLM Retry] {type(e).__name__} from {_safe_url_label(url)}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                if emit_final_error: yield err
+                time.sleep(d); continue
+            if emit_final_error: yield err
+            return [{"type": "text", "text": err}]
         except Exception as e:
             err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
-            yield err; return [{"type": "text", "text": err}]
+            if emit_final_error: yield err
+            return [{"type": "text", "text": err}]
 
 def _openai_stream(sess, messages):
     model, api_mode = sess.model, sess.api_mode
@@ -413,7 +454,24 @@ def _openai_stream(sess, messages):
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
     if sess.service_tier: payload["service_tier"] = sess.service_tier
     parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
-    return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
+    use_stream_fallback = sess.stream and getattr(sess, "stream_fallback", True)
+    blocks = yield from _stream_with_retry(sess, url, headers, payload, parse_fn, emit_final_error=not use_stream_fallback)
+    if use_stream_fallback and _blocks_are_error(blocks):
+        fallback_payload = dict(payload)
+        fallback_payload["stream"] = False
+        fallback_payload.pop("stream_options", None)
+        fallback_headers = dict(headers)
+        fallback_headers["Accept"] = "application/json"
+        print(f"[LLM Fallback] Stream failed on {_safe_url_label(url)}; retrying once with stream=False")
+        blocks = yield from _stream_with_retry(
+            sess,
+            url,
+            fallback_headers,
+            fallback_payload,
+            lambda r: _parse_openai_json(r.json(), api_mode),
+            request_stream=False,
+        )
+    return blocks
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
     if api_mode == "responses":
@@ -525,8 +583,9 @@ class BaseSession:
         self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 30) if self.stream else (10, 240)
-        self.connect_timeout = max(1, int(cfg.get('timeout', default_ct)))
+        self.connect_timeout = max(1, int(cfg.get('connect_timeout', cfg.get('timeout', default_ct))))
         self.read_timeout = max(5, int(cfg.get('read_timeout', default_rt)))
+        self.stream_fallback = cfg.get('stream_fallback', True)
         def _enum(key, valid):
             v = cfg.get(key); v = None if v is None else str(v).strip().lower()
             return v if not v or v in valid else print(f"[WARN] Invalid {key} {v!r}, ignored.")
@@ -927,7 +986,7 @@ class MixinSession:
         return self._cur_idx
     def _raw_ask(self, *args, **kwargs):
         base, n = self._pick(), len(self._sessions)
-        test_error = lambda x: isinstance(x, str) and x.lstrip().startswith(('!!!Error:', '[Error:'))
+        test_error = _is_retryable_llm_error
         for attempt in range(self._retries + 1):
             idx = (base + attempt) % n
             gen = self._orig_raw_asks[idx](*args, **kwargs)
@@ -939,7 +998,8 @@ class MixinSession:
                     if not yielded and test_error(chunk): continue
                     yield chunk; yielded = True
             except StopIteration as e: return_val = e.value or []
-            is_err = test_error(last_chunk)
+            block_text = "\n".join(str(b.get("text", "")) for b in return_val if isinstance(b, dict)) if isinstance(return_val, list) else ""
+            is_err = test_error(last_chunk) or test_error(block_text)
             if not is_err:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
                 elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:

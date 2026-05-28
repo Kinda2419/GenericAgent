@@ -1,4 +1,4 @@
-import sys, os, re, json, time, threading, importlib
+﻿import sys, os, re, json, time, threading, importlib
 from datetime import datetime
 from pathlib import Path
 import tempfile, traceback, subprocess, itertools, collections, difflib
@@ -8,7 +8,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agent_loop import BaseHandler, StepOutcome, json_default
 script_dir = os.path.dirname(os.path.abspath(__file__))
-
+GA_CORE_SOURCE_FILES = {
+    "ga.py",
+    "agentmain.py",
+    "agent_loop.py",
+    "llmcore.py",
+    os.path.join("assets", "tools_schema.json"),
+    os.path.join("assets", "tools_schema_cn.json"),
+    os.path.join("tools", "auto_repair.py"),
+}
 def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=None, maxlen=10000):
     """代码执行器
     python: 运行复杂的 .py 脚本（文件模式）
@@ -273,6 +281,20 @@ class GenericAgentHandler(BaseHandler):
         if not path: return ""
         return os.path.abspath(os.path.join(self.cwd, path))   
 
+    def _auto_repair_core_source_violation(self, path):
+        if getattr(self.parent, "task_dir", "") != "_auto_repair":
+            return None
+        abs_path = os.path.abspath(path)
+        root = os.path.abspath(script_dir)
+        try:
+            rel = os.path.relpath(abs_path, root)
+        except ValueError:
+            return None
+        rel_norm = os.path.normpath(rel)
+        core = {os.path.normpath(p) for p in GA_CORE_SOURCE_FILES}
+        if rel_norm in core:
+            return f"auto_repair is not allowed to modify GA core source: {rel_norm}"
+        return None
     def _extract_code_block(self, response, code_type):
         code_type = {'python':'python|py', 'powershell':'powershell|ps1|pwsh', 'bash':'bash|sh|shell'}.get(code_type, re.escape(code_type))
         matches = re.findall(rf"```(?:{code_type})\n(.*?)\n```", response.content, re.DOTALL)
@@ -358,6 +380,8 @@ class GenericAgentHandler(BaseHandler):
     def do_file_patch(self, args, response):
         path = self._get_abs_path(args.get("path", ""))
         yield f"[Action] Patching file: {path}\n"
+        if violation := self._auto_repair_core_source_violation(path):
+            return StepOutcome({"status": "error", "msg": violation}, next_prompt="`n")
         old_content = args.get("old_content", "")
         new_content = args.get("new_content", "")
         try: new_content = expand_file_refs(new_content, base_dir=self.cwd)
@@ -374,6 +398,8 @@ class GenericAgentHandler(BaseHandler):
         需要将要写入的内容放在<file_content>标签内，或者放在代码块中'''
         path = self._get_abs_path(args.get("path", ""))
         mode = args.get("mode", "overwrite")  # overwrite/append/prepend
+        if violation := self._auto_repair_core_source_violation(path):
+            return StepOutcome({"status": "error", "msg": violation}, next_prompt="`n")
         action_str = {"prepend": "Prepending to", "append": "Appending to"}.get(mode, "Overwriting")
         yield f"[Action] {action_str} file: {os.path.basename(path)}\n"
 
@@ -444,6 +470,26 @@ class GenericAgentHandler(BaseHandler):
         #next_prompt += '\n[SYSTEM TIPS] 此函数一般在任务开始或中间时调用，如果任务已成功完成应该是start_long_term_update用于结算长期记忆。\n'
         return StepOutcome({"result": "working key_info updated"}, next_prompt=next_prompt)
 
+    def do_list_dir(self, args, response):
+        path = self._get_abs_path(args.get("path") or ".")
+        max_items = max(1, min(int(args.get("max_items") or 200), 500))
+        yield f"[Action] Listing directory: {path}\n"
+        try:
+            entries = []
+            for item in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))[:max_items]:
+                stat = item.stat()
+                entries.append({
+                    "name": item.name,
+                    "type": "dir" if item.is_dir() else "file",
+                    "size": stat.st_size,
+                    "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                })
+            result = {"status": "success", "path": path, "entries": entries}
+        except Exception as e:
+            result = {"status": "error", "path": path, "msg": str(e)}
+        next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
+        return StepOutcome(result, next_prompt=next_prompt)
+
     def _retry_or_exit(self, prompt):
         self._empty_ct = getattr(self, '_empty_ct', 0) + 1
         if self._empty_ct >= 3: return StepOutcome({}, should_exit=True)
@@ -458,7 +504,7 @@ class GenericAgentHandler(BaseHandler):
         if not response or (not content.strip() and not thinking.strip()):
             yield "[Warn] LLM returned an empty response. Retrying...\n"
             return self._retry_or_exit("[System] Blank response, regenerate and tooluse")
-        if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[-100:]:
+        if any(x in content[-200:] for x in ('[!!! 流异常中断', '[!!! Stream interrupted:', 'ChunkedEncodingError', 'Response ended prematurely', '!!!Error:')):
             return self._retry_or_exit("[System] Incomplete response. Regenerate and tooluse.")
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[System] max_tokens limit reached. Use multi small steps to do it.")
@@ -587,3 +633,4 @@ def get_global_memory():
         prompt += insight + "\n"
     except FileNotFoundError: pass
     return prompt
+

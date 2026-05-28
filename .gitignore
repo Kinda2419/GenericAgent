@@ -118,3 +118,7 @@ reflect/*
 **/__pycache__/
 
 .claude/
+
+# Backup files
+*.bak
+*.bak-*

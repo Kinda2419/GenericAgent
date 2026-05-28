@@ -12,20 +12,36 @@ try:
 except:
     print("Please ask the agent install python-telegram-bot to use telegram module.")
     sys.exit(1)
-from chatapp_common import (
-    FILE_HINT,
-    HELP_TEXT,
-    TELEGRAM_MENU_COMMANDS,
-    clean_reply,
-    ensure_single_instance,
-    extract_files,
-    format_restore,
-    redirect_log,
-    require_runtime,
-    split_text,
-)
-from continue_cmd import handle_frontend_command, reset_conversation
-from btw_cmd import handle_frontend_command as handle_btw_frontend_command
+try:
+    from .chatapp_common import (
+        FILE_HINT,
+        HELP_TEXT,
+        TELEGRAM_MENU_COMMANDS,
+        clean_reply,
+        ensure_single_instance,
+        extract_files,
+        format_restore,
+        redirect_log,
+        require_runtime,
+        split_text,
+    )
+    from .continue_cmd import handle_frontend_command, reset_conversation
+    from .btw_cmd import handle_frontend_command as handle_btw_frontend_command
+except ImportError:
+    from chatapp_common import (
+        FILE_HINT,
+        HELP_TEXT,
+        TELEGRAM_MENU_COMMANDS,
+        clean_reply,
+        ensure_single_instance,
+        extract_files,
+        format_restore,
+        redirect_log,
+        require_runtime,
+        split_text,
+    )
+    from continue_cmd import handle_frontend_command, reset_conversation
+    from btw_cmd import handle_frontend_command as handle_btw_frontend_command
 from llmcore import mykeys
 
 agent = GeneraticAgent()

@@ -1,4 +1,4 @@
-import os, sys, threading, queue, time, json, re, random, locale
+﻿import os, sys, threading, queue, time, json, re, random, locale
 os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
@@ -72,6 +72,16 @@ class GenericAgent:
                     else: llm_sessions[i] = ToolClient(mixin)
                 except Exception as e: print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
         self.llmclients = llm_sessions
+        default_llm = mykeys.get('default_llm_name', mykeys.get('default_llm'))
+        if default_llm and not getattr(self, '_default_llm_applied', False):
+            try:
+                self.llm_no = int(default_llm)
+            except (TypeError, ValueError):
+                for i, client in enumerate(self.llmclients):
+                    if getattr(getattr(client, 'backend', None), 'name', None) == default_llm:
+                        self.llm_no = i
+                        break
+            self._default_llm_applied = True
         self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
         if oldhistory: self.llmclient.backend.history = oldhistory
     
@@ -243,13 +253,13 @@ if __name__ == '__main__':
     parser.add_argument('--input', help='prompt')
     parser.add_argument('--llm_no', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('--nobg', action='store_true')
+    parser.add_argument('--bg', action='store_true', help='popen, print PID, exit')
     args, _unknown = parser.parse_known_args()
     _reflect_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
 
-    if args.task and not args.nobg:
+    if args.bg:
         import subprocess, platform
-        cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:]] + ['--nobg']
+        cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:] if a != '--bg']
         d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
         p = subprocess.Popen(cmd, cwd=script_dir,
             creationflags=0x08000000 if platform.system() == 'Windows' else 0,
@@ -337,3 +347,4 @@ if __name__ == '__main__':
             except KeyboardInterrupt:
                 agent.abort()
                 print('\n[Interrupted]')
+

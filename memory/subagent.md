@@ -3,16 +3,15 @@
 ## 文件IO协议
 
 - 目录：`temp/{task_name}/`（cwd在temp/时即`./{task_name}/`）
-- 启动：`python agentmain.py --task {name} [--input "短文本"] [--llm_no N]`（cwd=代码根）
+- 启动：`python agentmain.py --task {name} [--input "短文本"] [--bg] [--llm_no N]`（cwd=代码根）
 - `--input`自动建目录+清旧output+写input.txt；长文本先手动写input.txt再启动(不带--input)
-- 自动后台启动，print PID then exit
+- 优先用`--bg`后台(print PID exit)，可同一code_run内sleep后poll；非--bg禁合并启动+轮询
 - subagent的cwd还是temp，不是task目录
 - input：目标+约束即可，subagent同等智能。**禁写步骤/过度描述**，大量数据给路径
-- 可选fork功能（继承对话上下文）: code_run(inline_eval=True)，将变量history（自动注入,str）写入task目录下_history.json
 - 通信：output.txt(append,`[ROUND END]`=轮完成) → 写reply.txt继续 → 不写10min退出。reply后输出为output1/2/3.txt(同格式)
 - 干预文件：`_stop`(当轮结束退出) | `_keyinfo`(注入working memory) | `_intervene`(追加指令)
-- 监察模式：**主agent空闲时应读output观察进度，必要时用干预文件纠偏，禁止无脑长时间sleep**
-- 若加`--verbose`，output将包含工具执行结果，主agent可直接审查原始数据而非仅信任摘要
+- **主agent空闲时应读output观察进度，必要时用干预文件纠偏，禁止无脑长时间sleep轮询**
+- 监察模式启动时加`--verbose`，output将包含工具执行结果，主agent可直接审查原始数据而非仅信任摘要
 
 ## 场景1：测试模式 - 行为验证
 **用途**：观察agent真实行为，修正RULES/L2/L3/SOP
@@ -35,6 +34,20 @@
 1. 主agent准备阶段：爬取/dump数据，存为多个独立输入文件
 2. 分发：对每个文件启动一个subagent处理（主agent自己也可以处理其中一个）
 3. 收集：等所有subagent完成，主agent读取各输出文件，汇总结果
+
+## 场景3：升级模式 - 复杂任务委派 Codex CLI
+**用途**：当任务涉及复杂编程（多文件重构/架构设计/陌生技术栈/大量代码生成），subagent或主agent能力不足时，升级委派给Codex CLI
+**触发条件**（满足任一即可升级）：
+- 复杂代码生成/重构：多文件联动修改、架构级重构、>200行新代码
+- 陌生技术栈：对该框架/语言不熟悉，试错已超2轮
+- 反复失败：同一编程子任务已失败2次
+- 上下文饱和：需要理解大量代码上下文后做精确修改
+
+**调用方式**：参见 `codex_cli_sop.md`
+**核心原则**：
+- 不要硬撑，识别到超能力边界时果断升级
+- Codex产出必须验证（编译/运行/检查），不盲信
+- Codex适合纯编程任务，不适合需要浏览器/键鼠/GUI操作的任务
 
 ## subagent内部plan_mode使用
 **原则**：subagent本身是完整agent，接收多步骤任务时应在内部创建plan管理执行

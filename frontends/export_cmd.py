@@ -6,7 +6,10 @@ import re
 import sys
 from datetime import datetime
 
-from continue_cmd import _pairs, _assistant_text
+try:
+    from .continue_cmd import _pairs, _assistant_text
+except ImportError:
+    from continue_cmd import _pairs, _assistant_text
 
 _TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'temp')
 _BACKTICK_RUN_RE = re.compile(r'`+')

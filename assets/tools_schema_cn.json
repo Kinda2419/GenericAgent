@@ -53,6 +53,13 @@
       "switch_tab_id": {"type": "string", "description": "可选的标签页 ID，切换到该标签页执行"}}}
   }},
   {"type": "function", "function": {
+    "name": "list_dir",
+    "description": "列出本地目录中的文件和文件夹。读取未知项目目录前使用。只读。",
+    "parameters": {"type": "object", "properties": {
+      "path": {"type": "string", "description": "相对或绝对目录路径", "default": "."},
+      "max_items": {"type": "integer", "description": "最多返回条目数", "default": 200}}}
+  }},
+  {"type": "function", "function": {
     "name": "update_working_checkpoint",
     "description": "短期工作便签，每轮自动注入上下文，防长任务信息丢失。前中期调用，非结束时。何时调用：(1)任务开始读SOP后，存用户需求和关键约束/参数（简单1-2步任务除外）；(2)子任务切换或上下文即将被冲刷前；(3)多次重试失败后，重读SOP并必须调用存储新发现；(4)切换新任务时更新内容，清旧进度但保留仍有效的约束。\n\n何时不调用：简单任务（1-2步且无严重约束）、任务已完成时（应当用长期结算工具）",
     "parameters": {"type": "object", "properties": {
