@@ -25,6 +25,8 @@ from chatapp_common import (
     split_text,
 )
 from continue_cmd import handle_frontend_command, reset_conversation
+from btw_cmd import handle_frontend_command as handle_btw_frontend_command
+from review_cmd import handle as handle_review_command
 from llmcore import mykeys
 
 agent = GeneraticAgent()
@@ -41,11 +43,19 @@ _RETRY_AFTER_MARGIN_SECONDS = 1.0
 _QUEUE_WAIT_SECONDS = 1
 _ASK_USER_HOOK_KEY = "telegram_ask_user_menu"
 _ASK_CALLBACK_PREFIX = "ask:"
+_LLM_CALLBACK_PREFIX = "llm:"
 _ASK_CANCEL_ACTION = "none"
+_ASK_MULTI_DONE_ACTION = "done"
+_ASK_TOGGLE_ACTION = "toggle"
 _ASK_CANCEL_LABEL = "none of these above"
 _ASK_CANCEL_PROMPT = "已取消选择，请直接发送下一步操作。"
+_ASK_MULTI_HINT = "可多选：点选项目后点击 Done 提交。"
+_ASK_MULTI_EMPTY_HINT = "请至少选择一项，或选择 none of these above。"
+_LLM_MENU_PROMPT = "请选择要切换的 LLM："
 _ask_menu_events = Q.Queue()
 _ask_menu_store = {}
+_llm_menu_store = {}
+_MULTI_SELECT_RE = re.compile(r"\[?(?:多选|multi(?:[-_ ]?select)?|select all)\]?", re.IGNORECASE)
 _QUOTE_OPEN_TAG = "<_quote_>"
 _QUOTE_CLOSE_TAG = "</_quote_>"
 _QUOTE_TOKEN_PATTERN = re.escape(_QUOTE_OPEN_TAG) + r"([\s\S]*?)" + re.escape(_QUOTE_CLOSE_TAG)
@@ -264,7 +274,11 @@ def _extract_ask_user_event(ctx):
     if not candidates:
         return None
     question = str(data.get("question") or "请选择下一步操作：").strip() or "请选择下一步操作："
-    return {"question": question, "candidates": candidates}
+    return {
+        "question": question,
+        "candidates": candidates,
+        "multi": bool(_MULTI_SELECT_RE.search(question)),
+    }
 
 def _register_ask_user_hook():
     if not hasattr(agent, "_turn_end_hooks"):
@@ -284,24 +298,48 @@ def _drain_latest_ask_user_event():
             break
     return latest
 
-def _build_ask_user_markup(menu_id, candidates):
-    rows = [
-        [InlineKeyboardButton(candidate, callback_data=f"{_ASK_CALLBACK_PREFIX}{menu_id}:{idx}")]
-        for idx, candidate in enumerate(candidates)
-    ]
+def _build_ask_user_markup(menu_id, candidates, multi=False, selected_indexes=None):
+    selected_indexes = set(selected_indexes or [])
+    rows = []
+    for idx, candidate in enumerate(candidates):
+        if multi:
+            label = f"✓ {candidate}" if idx in selected_indexes else candidate
+            action = f"{_ASK_TOGGLE_ACTION}:{idx}"
+        else:
+            label = candidate
+            action = str(idx)
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"{_ASK_CALLBACK_PREFIX}{menu_id}:{action}")
+        ])
+    if multi:
+        rows.append([
+            InlineKeyboardButton("Done", callback_data=f"{_ASK_CALLBACK_PREFIX}{menu_id}:{_ASK_MULTI_DONE_ACTION}")
+        ])
     rows.append([
         InlineKeyboardButton(_ASK_CANCEL_LABEL, callback_data=f"{_ASK_CALLBACK_PREFIX}{menu_id}:{_ASK_CANCEL_ACTION}")
     ])
     return InlineKeyboardMarkup(rows)
 
-def _parse_ask_callback_data(data):
-    if not (data or "").startswith(_ASK_CALLBACK_PREFIX):
+def _build_llm_markup(menu_id, llms):
+    rows = []
+    for idx, name, current in llms:
+        label = f"→ [{idx}] {name}" if current else f"[{idx}] {name}"
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"{_LLM_CALLBACK_PREFIX}{menu_id}:{idx}")
+        ])
+    return InlineKeyboardMarkup(rows)
+
+def _parse_menu_callback_data(data, prefix):
+    if not (data or "").startswith(prefix):
         return None, None
-    payload = data[len(_ASK_CALLBACK_PREFIX):]
+    payload = data[len(prefix):]
     menu_id, sep, action = payload.partition(":")
     if not sep or not menu_id or not action:
         return None, None
     return menu_id, action
+
+def _parse_ask_callback_data(data):
+    return _parse_menu_callback_data(data, _ASK_CALLBACK_PREFIX)
 
 def _build_text_prompt(text):
     return f"{FILE_HINT}\n\n{text}"
@@ -312,11 +350,15 @@ def _normalize_ask_menu_event(stored):
         return {
             "question": str(stored.get("question") or "请选择下一步操作：").strip() or "请选择下一步操作：",
             "candidates": [str(candidate).strip() for candidate in candidates if str(candidate).strip()],
+            "multi": bool(stored.get("multi")),
+            "selected": [int(idx) for idx in stored.get("selected", []) if isinstance(idx, int)],
         }
     if isinstance(stored, (list, tuple)):
         return {
             "question": "请选择下一步操作：",
             "candidates": [str(candidate).strip() for candidate in stored if str(candidate).strip()],
+            "multi": False,
+            "selected": [],
         }
     return None
 
@@ -356,11 +398,18 @@ async def _edit_ask_user_result(query, event, selected=None, cancelled=False):
 async def _send_ask_user_menu(root_msg, event):
     menu_id = uuid.uuid4().hex[:16]
     candidates = event["candidates"]
-    _ask_menu_store[menu_id] = {"question": event["question"], "candidates": list(candidates)}
+    multi = bool(event.get("multi"))
+    _ask_menu_store[menu_id] = {
+        "question": event["question"],
+        "candidates": list(candidates),
+        "multi": multi,
+        "selected": [],
+    }
+    prompt = f"{event['question']}\n\n{_ASK_MULTI_HINT}" if multi else event["question"]
     try:
         await root_msg.reply_text(
-            event["question"],
-            reply_markup=_build_ask_user_markup(menu_id, candidates),
+            prompt,
+            reply_markup=_build_ask_user_markup(menu_id, candidates, multi=multi),
         )
     except Exception as exc:
         _ask_menu_store.pop(menu_id, None)
@@ -380,6 +429,7 @@ class _TelegramStreamSession:
         self.sent_segments = 0
         self.active_display = ""
         self.pending_display = ""
+        self._edit_overflow_msgs = {}
         self.retry_until = 0.0
         self.last_update_at = 0.0
         self.last_update_raw_len = 0
@@ -600,15 +650,66 @@ class _TelegramStreamSession:
                 raise
         return updated if hasattr(updated, "edit_text") else msg
 
+    def _message_key(self, msg):
+        chat_id = getattr(getattr(msg, "chat", None), "id", None)
+        message_id = getattr(msg, "message_id", None)
+        if chat_id is not None and message_id is not None:
+            return (chat_id, message_id)
+        if message_id is not None:
+            return ("message", message_id)
+        return ("object", id(msg))
+
+    async def _delete_text_once(self, msg):
+        delete = getattr(msg, "delete", None)
+        if delete is None:
+            return
+        try:
+            result = delete()
+            if hasattr(result, "__await__"):
+                await result
+        except RetryAfter as exc:
+            self._set_retry_after(exc)
+            raise
+        except Exception as exc:
+            print(f"[TG stale overflow delete error] {type(exc).__name__}: {exc}", flush=True)
+
+    async def _delete_text(self, msg, wait_retry=True):
+        if wait_retry:
+            await self._retry_call(self._delete_text_once, msg)
+        else:
+            await self._delete_text_once(msg)
+
     async def _edit_text(self, msg, text, wait_retry=True):
         segments = _markdown_safe_segments(text) or ["..."]
+        old_key = self._message_key(msg)
+        overflow_msgs = self._edit_overflow_msgs.get(old_key, [])
         if wait_retry:
             updated = await self._retry_call(self._edit_text_once, msg, segments[0])
         else:
             updated = await self._edit_text_once(msg, segments[0])
-        for segment in segments[1:]:
-            updated = await self._reply_text(segment, wait_retry=wait_retry)
-        return updated if hasattr(updated, "edit_text") else msg
+        primary_msg = updated if hasattr(updated, "edit_text") else msg
+        self._edit_overflow_msgs.pop(old_key, None)
+
+        new_overflow_msgs = []
+        for index, segment in enumerate(segments[1:]):
+            if index < len(overflow_msgs):
+                overflow_msg = overflow_msgs[index]
+                if wait_retry:
+                    edited_overflow = await self._retry_call(self._edit_text_once, overflow_msg, segment)
+                else:
+                    edited_overflow = await self._edit_text_once(overflow_msg, segment)
+                new_overflow_msgs.append(
+                    edited_overflow if hasattr(edited_overflow, "edit_text") else overflow_msg
+                )
+            else:
+                new_overflow_msgs.append(await self._reply_text(segment, wait_retry=wait_retry))
+
+        for stale_msg in overflow_msgs[len(new_overflow_msgs):]:
+            await self._delete_text(stale_msg, wait_retry=wait_retry)
+
+        if new_overflow_msgs:
+            self._edit_overflow_msgs[self._message_key(primary_msg)] = new_overflow_msgs
+        return primary_msg
 
     async def _upsert_live_message(self, text, wait_retry=True):
         if self.live_msg is None:
@@ -760,6 +861,36 @@ def _cancel_stream_task(ctx):
 async def _sync_commands(application):
     await application.bot.set_my_commands([BotCommand(command, description) for command, description in TELEGRAM_MENU_COMMANDS])
 
+async def _reply_command_text(message, text):
+    for segment in _markdown_safe_segments(text) or ["..."]:
+        try:
+            await message.reply_text(_to_markdown_v2(segment), parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception as exc:
+            print(f"[TG command markdown fallback] {type(exc).__name__}: {exc}", flush=True)
+            await message.reply_text(segment)
+
+def _review_command_body(cmd):
+    cmd = (cmd or "").strip()
+    if cmd == "/review":
+        return ""
+    if cmd.startswith("/review "):
+        return cmd[len("/review"):].strip()
+    return ""
+
+async def _handle_review_command(update, ctx, cmd):
+    dq = Q.Queue()
+    prompt = handle_review_command(agent, _review_command_body(cmd), dq)
+    if not prompt:
+        try:
+            item = dq.get_nowait()
+            return await _reply_command_text(update.message, item.get("done", ""))
+        except Q.Empty:
+            return await _reply_command_text(update.message, "(review 无输出)")
+    _cancel_stream_task(ctx)
+    task_dq = agent.put_task(prompt, source="telegram")
+    task = asyncio.create_task(_stream(task_dq, update.message))
+    ctx.user_data['stream_task'] = task
+
 async def handle_msg(update, ctx):
     uid = update.effective_user.id
     if ALLOWED and uid not in ALLOWED:
@@ -784,6 +915,45 @@ async def handle_ask_callback(update, ctx):
         await query.answer("菜单已过期")
         return await _clear_ask_reply_markup(query)
     candidates = event["candidates"]
+    if event.get("multi") and action.startswith(f"{_ASK_TOGGLE_ACTION}:"):
+        try:
+            selected_idx = int(action.split(":", 1)[1])
+            if selected_idx < 0 or selected_idx >= len(candidates):
+                raise ValueError
+        except ValueError:
+            return await query.answer("菜单无效")
+        stored = _ask_menu_store.get(menu_id)
+        if not isinstance(stored, dict):
+            return await query.answer("菜单已过期")
+        selected = set(stored.get("selected", []))
+        if selected_idx in selected:
+            selected.remove(selected_idx)
+        else:
+            selected.add(selected_idx)
+        stored["selected"] = sorted(selected)
+        await query.answer()
+        return await query.edit_message_reply_markup(
+            reply_markup=_build_ask_user_markup(
+                menu_id,
+                candidates,
+                multi=True,
+                selected_indexes=stored["selected"],
+            )
+        )
+    if event.get("multi") and action == _ASK_MULTI_DONE_ACTION:
+        selected_indexes = event.get("selected") or []
+        if not selected_indexes:
+            return await query.answer(_ASK_MULTI_EMPTY_HINT, show_alert=True)
+        selected = "; ".join(candidates[idx] for idx in selected_indexes)
+        _ask_menu_store.pop(menu_id, None)
+        await query.answer()
+        await _edit_ask_user_result(query, event, selected=selected)
+        if query.message is None:
+            return
+        dq = agent.put_task(_build_text_prompt(selected), source="telegram")
+        task = asyncio.create_task(_stream(dq, query.message))
+        ctx.user_data['stream_task'] = task
+        return
     if action == _ASK_CANCEL_ACTION:
         _ask_menu_store.pop(menu_id, None)
         await query.answer()
@@ -804,6 +974,52 @@ async def handle_ask_callback(update, ctx):
     task = asyncio.create_task(_stream(dq, query.message))
     ctx.user_data['stream_task'] = task
 
+async def _send_llm_menu(message):
+    llms = agent.list_llms()
+    if not llms:
+        return await message.reply_text("没有可用模型。")
+    menu_id = uuid.uuid4().hex[:16]
+    _llm_menu_store[menu_id] = [idx for idx, _, _ in llms]
+    lines = [f"{'→' if cur else '  '} [{idx}] {name}" for idx, name, cur in llms]
+    try:
+        await message.reply_text(
+            _LLM_MENU_PROMPT,
+            reply_markup=_build_llm_markup(menu_id, llms),
+        )
+    except Exception as exc:
+        _llm_menu_store.pop(menu_id, None)
+        print(f"[TG llm menu error] {type(exc).__name__}: {exc}", flush=True)
+        await message.reply_text("LLMs:\n" + "\n".join(lines))
+
+async def handle_llm_callback(update, ctx):
+    query = update.callback_query
+    if query is None:
+        return
+    uid = update.effective_user.id if update.effective_user else None
+    if ALLOWED and uid not in ALLOWED:
+        return await query.answer("no", show_alert=True)
+    menu_id, action = _parse_menu_callback_data(query.data, _LLM_CALLBACK_PREFIX)
+    if not menu_id:
+        return await query.answer("菜单无效")
+    valid_indexes = _llm_menu_store.get(menu_id)
+    if valid_indexes is None:
+        await query.answer("菜单已过期")
+        return await _clear_ask_reply_markup(query)
+    try:
+        selected_idx = int(action)
+    except (TypeError, ValueError):
+        return await query.answer("菜单无效")
+    if selected_idx not in valid_indexes:
+        return await query.answer("菜单已过期", show_alert=True)
+    try:
+        agent.next_llm(selected_idx)
+        selected_name = agent.get_llm_name()
+    except Exception as exc:
+        return await query.answer(f"切换失败: {exc}", show_alert=True)
+    _llm_menu_store.pop(menu_id, None)
+    await query.answer(f"已切换到 [{selected_idx}] {selected_name}")
+    await query.edit_message_text(f"✅ 已切换到 [{selected_idx}] {selected_name}")
+
 async def cmd_abort(update, ctx):
     _cancel_stream_task(ctx)
     agent.abort()
@@ -819,8 +1035,7 @@ async def cmd_llm(update, ctx):
         except (ValueError, IndexError):
             await update.message.reply_text(f"用法: /llm <0-{len(agent.list_llms())-1}>")
     else:
-        lines = [f"{'→' if cur else '  '} [{i}] {name}" for i, name, cur in agent.list_llms()]
-        await update.message.reply_text("LLMs:\n" + "\n".join(lines))
+        await _send_llm_menu(update.message)
 
 async def handle_photo(update, ctx):
     uid = update.effective_user.id
@@ -856,6 +1071,11 @@ async def handle_command(update, ctx):
         return await update.message.reply_text(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
     if op == '/stop': return await cmd_abort(update, ctx)
     if op == '/llm': return await cmd_llm(update, ctx)
+    if op == '/btw':
+        answer = await asyncio.to_thread(handle_btw_frontend_command, agent, cmd)
+        return await _reply_command_text(update.message, answer)
+    if op == '/review':
+        return await _handle_review_command(update, ctx, cmd)
     if op == '/new':
         _cancel_stream_task(ctx)
         return await update.message.reply_text(reset_conversation(agent))
@@ -905,6 +1125,7 @@ if __name__ == '__main__':
             app = (ApplicationBuilder().token(mykeys['tg_bot_token'])
                    .request(request).get_updates_request(request).post_init(_sync_commands).build())
             app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
+            app.add_handler(CallbackQueryHandler(handle_llm_callback, pattern=r"^llm:"))
             app.add_handler(MessageHandler(filters.COMMAND, handle_command))
             app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
             app.add_handler(MessageHandler(filters.Document.ALL, handle_photo))

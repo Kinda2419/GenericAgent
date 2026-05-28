@@ -75,7 +75,11 @@ class QQApp(AgentChatMixin):
         api = self.client.api.post_group_message if is_group else self.client.api.post_c2c_message
         key = "group_openid" if is_group else "openid"
         for part in split_text(content, self.split_limit):
-            await api(**{key: chat_id, "msg_type": 0, "content": part, "msg_id": msg_id, "msg_seq": _next_msg_seq()})
+            seq = _next_msg_seq()
+            try:
+                await api(**{key: chat_id, "msg_type": 2, "markdown": {"content": part}, "msg_id": msg_id, "msg_seq": seq})
+            except Exception:
+                await api(**{key: chat_id, "msg_type": 0, "content": part, "msg_id": msg_id, "msg_seq": seq})
 
     async def on_message(self, data, is_group=False):
         try:
@@ -103,14 +107,19 @@ class QQApp(AgentChatMixin):
 
     async def start(self):
         self.client = _make_bot_class(self)()
+        delay, max_delay = 5, 300
         while True:
+            started_at = time.monotonic()
             try:
                 print(f"[QQ] bot starting... {time.strftime('%m-%d %H:%M')}")
                 await self.client.start(appid=APP_ID, secret=APP_SECRET)
             except Exception as e:
                 print(f"[QQ] bot error: {e}")
-            print("[QQ] reconnect in 5s...")
-            await asyncio.sleep(5)
+            if time.monotonic() - started_at >= 60:
+                delay = 5
+            print(f"[QQ] reconnect in {delay}s...")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
 
 
 if __name__ == "__main__":
