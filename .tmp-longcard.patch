@@ -1,0 +1,28 @@
+﻿*** Begin Patch
+*** Update File: frontends/fsapp.py
+@@
+-def _card_raw(elements):
+-    return json.dumps({
+-        "schema": "2.0",
+-        "config": {"streaming_mode": False, "width_mode": "fill"},
+-        "body": {"elements": elements},
+-    }, ensure_ascii=False)
++def _card_raw(elements, header=None):
++    payload = {
++        "schema": "2.0",
++        "config": {
++            "streaming_mode": False,
++            "width_mode": "fill",
++            "wide_screen_mode": True,
++            "update_multi": True,
++        },
++        "body": {
++            "direction": "vertical",
++            "vertical_spacing": "8px",
++            "elements": elements,
++        },
++    }
++    if header:
++        payload["header"] = header
++    return json.dumps(payload, ensure_ascii=False)
+*** End Patch

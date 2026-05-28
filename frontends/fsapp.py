@@ -32,6 +32,8 @@ _MSG_TYPE_MAP = {"image": "[image]", "audio": "[audio]", "file": "[file]", "medi
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 MEDIA_DIR = os.path.join(TEMP_DIR, "feishu_media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+SESSION_STATE_FILE = os.environ.get("GA_FEISHU_SESSION_STATE_FILE") or os.path.join(TEMP_DIR, "feishu_sessions.json")
+SHOW_TOOL_DETAILS = os.environ.get("GA_FEISHU_SHOW_TOOL_DETAILS", "").lower() in ("1", "true", "yes", "on")
 
 
 _TRUNC_TAIL = 300  # 截断兜底时保留原文尾部字符数
@@ -74,6 +76,76 @@ def _parse_json(raw):
         return json.loads(raw)
     except Exception:
         return {}
+
+
+def _feishu_card_error(code, msg):
+    """Detect Feishu interactive-card content/schema errors worth local repair."""
+    text = f"{code or ''} {msg or ''}".lower()
+    patterns = (
+        "230099",
+        "11310",
+        "failed to create card content",
+        "card table number over limit",
+        "element exceeds the limit",
+        "invalid card",
+        "invalid content",
+    )
+    return any(p in text for p in patterns)
+
+
+def _neutralize_markdown_tables(text):
+    """Feishu cards may reject too many markdown tables; render them as plain text."""
+    if not isinstance(text, str) or "|" not in text:
+        return text, False
+    changed = False
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        pipe_count = stripped.count("|")
+        looks_table = pipe_count >= 2 or bool(re.match(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$", stripped))
+        if looks_table:
+            out.append(line.replace("|", "¦"))
+            changed = True
+        else:
+            out.append(line)
+    return "\n".join(out), changed
+
+
+def _repair_card_obj(obj):
+    changed = False
+    if isinstance(obj, dict):
+        tag = obj.get("tag")
+        if tag == "collapsible_panel" and "padding" in obj:
+            obj.pop("padding", None)
+            changed = True
+        if tag in ("markdown", "lark_md") and isinstance(obj.get("content"), str):
+            obj["content"], hit = _neutralize_markdown_tables(obj["content"])
+            changed = changed or hit
+        for value in obj.values():
+            _, hit = _repair_card_obj(value)
+            changed = changed or hit
+    elif isinstance(obj, list):
+        for value in obj:
+            _, hit = _repair_card_obj(value)
+            changed = changed or hit
+    return obj, changed
+
+
+def _repair_card_json(card_json):
+    try:
+        payload = json.loads(card_json) if isinstance(card_json, str) else card_json
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload, changed = _repair_card_obj(payload)
+    if not changed:
+        return None
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _log_card_repair(action):
+    print(f"[WARN] Feishu card {action} failed; retrying with schema-safe content")
 
 
 def _extract_share_card_content(content_json, msg_type):
@@ -237,8 +309,130 @@ AGENT_TIMEOUT_SEC = 900
 
 runtime = GenericAgentRuntime()
 client, user_tasks = None, {}
-session_aliases = {}
 session_lock = threading.RLock()
+SESSION_STATE_SCHEMA_VERSION = 1
+SESSION_STATE_CORRUPT_SUFFIX = ".corrupt"
+
+
+def _empty_feishu_state():
+    return {
+        "schema_version": SESSION_STATE_SCHEMA_VERSION,
+        "session_aliases": {},
+        "chat_active_sessions": {},
+        "chat_default_llms": {},
+        "sessions": {},
+    }
+
+
+def _normalize_feishu_state(raw):
+    state = _empty_feishu_state()
+    if not isinstance(raw, dict):
+        return state
+    state["schema_version"] = int(raw.get("schema_version") or 0) or SESSION_STATE_SCHEMA_VERSION
+    for key in ("session_aliases", "chat_active_sessions", "chat_default_llms", "sessions"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            state[key] = dict(value)
+    if state["schema_version"] < SESSION_STATE_SCHEMA_VERSION:
+        state["schema_version"] = SESSION_STATE_SCHEMA_VERSION
+    return state
+
+
+def _backup_corrupt_session_state(path, error):
+    if not os.path.exists(path):
+        return None
+    backup = f"{path}{SESSION_STATE_CORRUPT_SUFFIX}-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(path, backup)
+        with open(backup + ".error.txt", "w", encoding="utf-8") as f:
+            f.write(str(error))
+        return backup
+    except Exception as backup_error:
+        print(f"[WARN] failed to back up corrupt Feishu session state: {backup_error}")
+        return None
+
+
+def _load_feishu_session_state(path=None):
+    path = path or SESSION_STATE_FILE
+    if not os.path.exists(path):
+        return _empty_feishu_state()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _normalize_feishu_state(json.load(f))
+    except Exception as e:
+        backup = _backup_corrupt_session_state(path, e)
+        print(f"[WARN] Feishu session state ignored after load failure: {e}" + (f"; backup={backup}" if backup else ""))
+        return _empty_feishu_state()
+
+
+def _apply_feishu_session_state(state):
+    state = _normalize_feishu_state(state)
+    session_aliases.clear()
+    session_aliases.update(state["session_aliases"])
+    chat_active_sessions.clear()
+    chat_active_sessions.update(state["chat_active_sessions"])
+    chat_default_llms.clear()
+    chat_default_llms.update(state["chat_default_llms"])
+    _persisted_sessions.clear()
+    _persisted_sessions.update(state["sessions"])
+    return state
+
+
+def reload_feishu_session_state(path=None):
+    with session_lock:
+        return _apply_feishu_session_state(_load_feishu_session_state(path))
+
+
+_state = _load_feishu_session_state()
+session_aliases = dict(_state.get("session_aliases") or {})
+chat_active_sessions = dict(_state.get("chat_active_sessions") or {})
+chat_default_llms = dict(_state.get("chat_default_llms") or {})
+_persisted_sessions = dict(_state.get("sessions") or {})
+
+
+def _persist_feishu_sessions():
+    with session_lock:
+        data = _empty_feishu_state()
+        data["session_aliases"] = dict(session_aliases)
+        data["chat_active_sessions"] = dict(chat_active_sessions)
+        data["chat_default_llms"] = dict(chat_default_llms)
+        data["sessions"] = dict(_persisted_sessions)
+        for sess in runtime.active_sessions():
+            sess.metadata["llm_no"] = getattr(sess.agent, "llm_no", sess.metadata.get("llm_no", 0))
+            data["sessions"][sess.session_id] = {
+                "metadata": dict(sess.metadata),
+                "history": list(getattr(sess.agent, "history", [])),
+                "updated_at": getattr(sess, "updated_at", time.time()),
+            }
+        parent = os.path.dirname(os.path.abspath(SESSION_STATE_FILE))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{SESSION_STATE_FILE}.tmp-{os.getpid()}-{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SESSION_STATE_FILE)
+        _persisted_sessions.clear()
+        _persisted_sessions.update(data["sessions"])
+        return data
+
+
+def _restore_feishu_session(session):
+    data = _persisted_sessions.get(session.session_id) or {}
+    metadata = data.get("metadata") or {}
+    if isinstance(metadata, dict):
+        session.metadata.update(metadata)
+    history = data.get("history")
+    if isinstance(history, list) and history and not getattr(session.agent, "history", None):
+        session.agent.history = list(history)
+    llm_no = session.metadata.get("llm_no")
+    if isinstance(llm_no, int) and getattr(session.agent, "llm_no", None) != llm_no:
+        try:
+            session.agent.next_llm(llm_no)
+        except Exception as e:
+            print(f"[WARN] failed to restore Feishu session model {llm_no}: {e}")
+    return session
 
 
 def _msg_attr(message, name, default=None):
@@ -259,45 +453,87 @@ def _session_key(chat_id, message_id):
     return f"{chat_id or 'direct'}:{message_id}"
 
 
+def _scope_key(open_id, chat_id):
+    return chat_id or open_id or 'direct'
+
+
+def _is_feishu_message_id(value):
+    return isinstance(value, str) and value.startswith("om_")
+
+
+def _message_root_id(message):
+    return _msg_attr(message, "root_id") or _msg_attr(message, "parent_id") or _msg_attr(message, "thread_id")
+
+
 def resolve_feishu_session(open_id, chat_id, message):
     with session_lock:
+        scope_key = _scope_key(open_id, chat_id)
         for mid in _message_thread_ids(message):
             sid = session_aliases.get(_session_key(chat_id, mid))
             if sid:
-                return runtime.get_or_create(sid, metadata={"open_id": open_id, "chat_id": chat_id}), False
-        root = _msg_attr(message, "root_id") or _msg_attr(message, "parent_id") or message.message_id
-        sid = _session_key(chat_id, root)
+                chat_active_sessions[scope_key] = sid
+                sess = runtime.get_or_create(sid, metadata={"open_id": open_id, "chat_id": chat_id})
+                _restore_feishu_session(sess)
+                _persist_feishu_sessions()
+                return sess, False
+        root = _message_root_id(message) or message.message_id
+        sid = root if str(root).startswith(f"{chat_id or 'direct'}:") else _session_key(chat_id, root)
         sess = runtime.get_or_create(sid, metadata={"open_id": open_id, "chat_id": chat_id, "root_message_id": root})
+        _restore_feishu_session(sess)
+        if "llm_no" not in sess.metadata and scope_key in chat_default_llms:
+            try:
+                sess.agent.next_llm(int(chat_default_llms[scope_key]))
+                sess.metadata["llm_no"] = sess.agent.llm_no
+            except Exception as e:
+                print(f"[WARN] failed to apply Feishu chat default model {chat_default_llms[scope_key]}: {e}")
+        chat_active_sessions[scope_key] = sid
         for mid in _message_thread_ids(message):
             session_aliases[_session_key(chat_id, mid)] = sid
         session_aliases[_session_key(chat_id, root)] = sid
+        _persist_feishu_sessions()
         return sess, True
 
 
 def _session_reply_anchor(session, fallback=None):
-    return session.metadata.get("root_message_id") or session.metadata.get("card_message_id") or fallback
+    for value in (session.metadata.get("card_message_id"), session.metadata.get("root_message_id"), fallback):
+        if _is_feishu_message_id(value):
+            return value
+    return fallback
 
 
 def bind_feishu_session_message(session, message_id):
     if not message_id:
         return
     chat_id = session.metadata.get("chat_id")
+    open_id = session.metadata.get("open_id")
+    scope_key = _scope_key(open_id, chat_id)
     with session_lock:
         session_aliases[_session_key(chat_id, message_id)] = session.session_id
+        chat_active_sessions[scope_key] = session.session_id
         session.metadata["card_message_id"] = message_id
-
-
+        _persist_feishu_sessions()
 def create_client():
     return lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).log_level(lark.LogLevel.INFO).build()
 
 
-def _card_raw(elements):
-    return json.dumps({
+def _card_raw(elements, header=None):
+    payload = {
         "schema": "2.0",
-        "config": {"streaming_mode": False, "width_mode": "fill"},
-        "body": {"elements": elements},
-    }, ensure_ascii=False)
-
+        "config": {
+            "streaming_mode": False,
+            "width_mode": "fill",
+            "wide_screen_mode": True,
+            "update_multi": True,
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": elements,
+        },
+    }
+    if header:
+        payload["header"] = header
+    return json.dumps(payload, ensure_ascii=False)
 
 def _card(text):
     return _card_raw([{"tag": "markdown", "content": text}])
@@ -310,6 +546,16 @@ def _send_raw(receive_id, payload, msg_type, rtype):
     r = client.im.v1.message.create(body)
     if r.success():
         return r.data.message_id if r.data else None
+    if msg_type == "interactive" and _feishu_card_error(getattr(r, "code", ""), getattr(r, "msg", "")):
+        repaired = _repair_card_json(payload)
+        if repaired and repaired != payload:
+            _log_card_repair("create")
+            body = CreateMessageRequest.builder().receive_id_type(rtype).request_body(
+                CreateMessageRequestBody.builder().receive_id(receive_id).msg_type(msg_type).content(repaired).build()
+            ).build()
+            r = client.im.v1.message.create(body)
+            if r.success():
+                return r.data.message_id if r.data else None
     print(f"发送失败: {r.code}, {r.msg}")
     return None
 
@@ -329,6 +575,20 @@ def _reply_raw(message_id, payload, msg_type, reply_in_thread=True):
         r = client.im.v1.message.reply(body)
         if r.success():
             return r.data.message_id if r.data else None
+        if msg_type == "interactive" and _feishu_card_error(getattr(r, "code", ""), getattr(r, "msg", "")):
+            repaired = _repair_card_json(payload)
+            if repaired and repaired != payload:
+                _log_card_repair("reply")
+                body = ReplyMessageRequest.builder().message_id(message_id).request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type(msg_type)
+                    .content(repaired)
+                    .reply_in_thread(reply_in_thread)
+                    .build()
+                ).build()
+                r = client.im.v1.message.reply(body)
+                if r.success():
+                    return r.data.message_id if r.data else None
         print(f"reply failed: {r.code}, {r.msg}")
     except Exception as e:
         print(f"[ERROR] _reply_raw network error: {e}")
@@ -344,10 +604,23 @@ def _patch_card_result(message_id, card_json):
         PatchMessageRequestBody.builder().content(card_json).build()
     ).build()
     r = client.im.v1.message.patch(body)
-    if not r.success():
-        print(f"[ERROR] patch_card 失败: {r.code}, {r.msg}")
+    if r.success():
+        return True, False
+    card_error = _feishu_card_error(getattr(r, "code", ""), getattr(r, "msg", ""))
+    if card_error:
+        repaired = _repair_card_json(card_json)
+        if repaired and repaired != card_json:
+            _log_card_repair("patch")
+            body = PatchMessageRequest.builder().message_id(message_id).request_body(
+                PatchMessageRequestBody.builder().content(repaired).build()
+            ).build()
+            r = client.im.v1.message.patch(body)
+            if r.success():
+                return True, False
+            card_error = _feishu_card_error(getattr(r, "code", ""), getattr(r, "msg", ""))
+    print(f"[ERROR] patch_card 失败: {r.code}, {r.msg}")
     msg = f"{getattr(r, 'code', '')} {getattr(r, 'msg', '')}".lower()
-    return r.success(), ("230099" in msg or "11310" in msg or "element exceeds the limit" in msg)
+    return False, (card_error or "element exceeds the limit" in msg)
 
 
 def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
@@ -360,6 +633,24 @@ def send_message(receive_id, content, msg_type="text", use_card=False, receive_i
 
 def _reply_text(message_id, content):
     return _reply_raw(message_id, json.dumps({"text": content}, ensure_ascii=False), "text", reply_in_thread=True)
+
+
+def _add_done_reaction(message_id):
+    if not message_id:
+        return False
+    try:
+        body = CreateMessageReactionRequest.builder().message_id(message_id).request_body(
+            CreateMessageReactionRequestBody.builder().reaction_type(
+                Emoji.builder().emoji_type("DONE").build()
+            ).build()
+        ).build()
+        r = client.im.v1.message_reaction.create(body)
+        if r.success():
+            return True
+        print(f"[ERROR] add DONE reaction failed: {r.code}, {r.msg}")
+    except Exception as e:
+        print(f"[ERROR] _add_done_reaction failed: {e}")
+    return False
 
 
 def update_message(message_id, content):
@@ -528,6 +819,8 @@ def _fmt_tool_call(tc):
 
 
 def _build_step_detail(resp, tool_calls):
+    if not SHOW_TOOL_DETAILS:
+        return ""
     """从 LLM response + tool_calls 组装单步展开详情（纯函数）。"""
     parts = []
     thinking = (getattr(resp, 'thinking', '') or '').strip() if resp else ''
@@ -548,6 +841,54 @@ def _section_title(text, index):
     return (first[:80] if first else f"Section {index}")
 
 
+def _strip_section_heading(body, title):
+    lines = (body or "").splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return "_(empty)_"
+    first = lines[0].strip()
+    normalized = re.sub(r"^[#>*`\s-]+", "", first).strip(" *")
+    normalized = re.sub(r"^\d+[.)?]\s*", "", normalized).strip()
+    if normalized == (title or "").strip():
+        lines = lines[1:]
+    return "\n".join(lines).strip() or "_(empty)_"
+
+
+def _compact_markdown_body(body):
+    # Long-answer panels use their header as the visible title. Keep body text
+    # compact by demoting markdown headings to bold lines.
+    lines = []
+    for line in (body or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            stripped = re.sub(r"^#{1,6}\s+", "", stripped).strip()
+            line = f"**{stripped}**" if stripped else ""
+        lines.append(line)
+    return "\n".join(lines).strip() or "_(empty)_"
+
+
+def _extract_tldr(final, sections):
+    text = (final or "").strip()
+    for title, body in sections:
+        candidate = _strip_section_heading(body, title)
+        if candidate and candidate != "_(empty)_":
+            text = candidate
+            break
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Task completed")
+    line = re.sub(r"^[#>*`\s-]+", "", line).strip(" *")
+    line = re.sub(r"^\d+[.)?]\s*", "", line).strip()
+    if "." in line and len(line) > 48:
+        bold, rest = line.split(".", 1)
+        return bold[:48], "." + rest[:90]
+    if len(line) <= 48:
+        return line, ""
+    return line[:48], line[48:138]
+
+
+def _word_count(text):
+    return len(re.findall(r"[\w\u4e00-\u9fff]+", text or ""))
+
 def _split_card_sections(text, limit=6000):
     text = (text or "").strip()
     if not text:
@@ -558,7 +899,7 @@ def _split_card_sections(text, limit=6000):
     if matches:
         for i, match in enumerate(matches):
             end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-            chunk = text[match.start():end].strip()
+            chunk = text[match.end():end].strip()
             title = re.sub(r"^[#\s]+", "", match.group(1)).strip(" *")
             sections.append((title or f"Section {i + 1}", chunk))
     else:
@@ -590,9 +931,11 @@ def _split_card_sections(text, limit=6000):
 
 
 class _TaskCard:
-    """飞书任务卡片：单卡片持续 patch；每步一个独立折叠面板（header 显示 summary，展开看详情）。"""
+    """飞书任务卡片：运行时展开工具过程，完成后折叠工具过程并展示正文。"""
     _DETAIL_LIMIT = 8000
     _FINAL_LIMIT = 6000
+    _FINAL_COLLAPSE_MIN_LEN = 1200
+    _FINAL_CARD_TITLE = "GA Long Answer"
 
     def __init__(self, receive_id, rid_type, reply_to_message_id=None):
         self.rid, self.rtype = receive_id, rid_type
@@ -612,18 +955,92 @@ class _TaskCard:
         if len(content) > limit:
             content = content[:limit] + f"\n\n... truncated, total {len(content)} chars"
         return {
-            "tag": "collapsible_panel", "expanded": False,
-            "header": {"title": {"tag": "plain_text", "content": (title or "Section")[:120]}},
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "background_color": "grey-100",
+            "border": {"color": "grey", "corner_radius": "5px"},
+            "vertical_spacing": "6px",
+            "header": {
+                "title": {"tag": "plain_text", "content": (title or "Section")[:120]},
+                "vertical_align": "center",
+                "icon": {"tag": "standard_icon", "token": "down-bold_outlined"},
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
             "elements": [{"tag": "markdown", "content": content}],
         }
 
-    def _step_panel(self, idx, summary, detail):
-        return self._panel(f"Turn {idx} - {summary}", detail or "_(empty)_", self._DETAIL_LIMIT)
+    def _card_header(self):
+        template = "green" if self.final else "blue"
+        # 让对话列表能看到回复核心内容（非final时从最新步骤摘要提取）
+        if self.final:
+            title = self._extract_card_title(self.final)
+        elif self.steps:
+            title = self._extract_card_title(self.steps[-1][0])  # 最近一步的summary
+        else:
+            title = self._FINAL_CARD_TITLE
+        return {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
+            "subtitle": {"tag": "plain_text", "content": self.status[:60]},
+            "icon": {"tag": "standard_icon", "token": "bot_outlined"},
+            "text_tag_list": [
+                {"tag": "text_tag", "text": {"tag": "plain_text", "content": "GA"}, "color": "blue"},
+                {"tag": "text_tag", "text": {"tag": "plain_text", "content": "Long"}, "color": "green"},
+            ],
+        }
 
-    def _final_panels(self):
-        sections = _split_card_sections(self.final or "_(empty)_", self._FINAL_LIMIT)
-        return [self._panel(title, body, self._FINAL_LIMIT) for title, body in sections]
+    @staticmethod
+    def _extract_card_title(text):
+        """从最终回答中提取一行短标题（<=48字符）用于卡片header显示。"""
+        text = (text or "").strip()
+        line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "GA回复")
+        line = re.sub(r"^[#>*`\s-]+", "", line).strip(" *")
+        line = re.sub(r"^\d+[.)?]\s*", "", line).strip()
+        if len(line) <= 48:
+            return line
+        # 尝试按标点截断
+        for sep in ("。", "！", "？", ". ", "! ", "? "):
+            idx = line.find(sep)
+            if 10 < idx <= 48:
+                return line[:idx + len(sep)]
+        return line[:45] + "..."
+    def _tool_panel(self):
+        if not self.steps:
+            return None
+        chunks = []
+        for idx, (summary, detail) in enumerate(self.steps, self.turn_base):
+            title = f"Turn {idx} - {summary or 'working'}"
+            body = (detail or "_(empty)_").strip()
+            if SHOW_TOOL_DETAILS:
+                chunks.append(f"### {title}\n\n{body}")
+            else:
+                chunks.append(f"- Turn {idx}: {summary or 'working'}")
+        content = "\n\n---\n\n".join(chunks) if SHOW_TOOL_DETAILS else "\n".join(chunks)
+        panel = self._panel(f"工具过程 · {len(self.steps)} turns", content, self._DETAIL_LIMIT * 2)
+        panel["expanded"] = self.final is None
+        return panel
 
+    def _final_elements(self):
+        final = (self.final or "_(empty)_").strip()
+        sections = _split_card_sections(final, self._FINAL_LIMIT)
+        should_collapse = len(sections) > 1 and len(final) >= self._FINAL_COLLAPSE_MIN_LEN
+        if not should_collapse:
+            return [{"tag": "markdown", "content": final}]
+        bold, rest = _extract_tldr(final, sections)
+        elements = [
+            {"tag": "markdown", "content": f"💡 **{bold}**{rest}"},
+            {"tag": "hr"},
+        ]
+        for idx, (title, body) in enumerate(sections):
+            icon = "✅" if idx == 0 else "📌"
+            panel = self._panel(f"{icon} {title}", _compact_markdown_body(_strip_section_heading(body, title)), self._FINAL_LIMIT)
+            panel["expanded"] = idx == 0
+            if idx == 0:
+                panel["header"]["background_color"] = "blue-50"
+            elements.append(panel)
+        elements.append({"tag": "markdown", "content": f"ℹ️ {len(sections)} sections · about {_word_count(final)} words · Feishu 7.20+"})
+        return elements
     def _build(self):
         header = f"**{self.status}**"
         if self.page_no > 1:
@@ -631,13 +1048,15 @@ class _TaskCard:
         els = [{"tag": "markdown", "content": header}]
         if self.note:
             els.append({"tag": "markdown", "content": self.note})
-        for i, (s, d) in enumerate(self.steps, self.turn_base):
-            els.append(self._step_panel(i, s, d))
         if self.final:
             els.append({"tag": "hr"})
-            els.extend(self._final_panels())
-        return _card_raw(els)
-
+            els.extend(self._final_elements())
+        tool_panel = self._tool_panel()
+        if tool_panel:
+            if self.final:
+                els.append({"tag": "hr"})
+            els.append(tool_panel)
+        return _card_raw(els, self._card_header())
     def _push(self):
         card = self._build()
         if self.msg_id:
@@ -690,15 +1109,34 @@ class _TaskCard:
         self._push()
 
 
-def _make_task_hook(card, done_event, on_final):
+def _is_incomplete_agent_output(text):
+    text = str(text or "")
+    markers = (
+        "[!!! Stream interrupted:",
+        "[!!! 流异常中断",
+        "ChunkedEncodingError",
+        "Response ended prematurely",
+        "OpenAI responses stream ended before response.completed",
+        "OpenAI chat stream ended before completion marker",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _make_task_hook(card, done_event, on_final, on_done_notice=None):
     """飞书任务 hook：每轮 patch 卡片状态；结束触发 on_final(raw) 处理附件。"""
     def hook(ctx):
         try:
             if ctx.get('exit_reason'):
                 resp = ctx.get('response')
                 raw = resp.content if hasattr(resp, 'content') else str(resp)
+                if _is_incomplete_agent_output(raw):
+                    card.fail("流异常中断，任务未完成")
+                    done_event.set()
+                    return
                 card.done(_display_text(raw))
                 on_final(raw)
+                if on_done_notice:
+                    on_done_notice()
                 done_event.set()
             elif ctx.get('summary'):
                 detail = _build_step_detail(ctx.get('response'), ctx.get('tool_calls') or [])
@@ -730,11 +1168,13 @@ def handle_message(data):
     task_item = {"user_input": user_input, "image_paths": image_paths, "message_id": message.message_id, "reply_to_message_id": reply_anchor}
     with session_lock:
         active_task = user_tasks.get(session.session_id)
-        if active_task:
+        if active_task and "queue" in active_task:
             active_task["queue"].put(task_item)
             active_task["queued"] = active_task.get("queued", 0) + 1
             _reply_text(_session_reply_anchor(session, message.message_id), "\u5df2\u653e\u5165\u672c\u8bdd\u9898\u961f\u5217\uff0c\u5f53\u524d\u4efb\u52a1\u5b8c\u6210\u540e\u4f1a\u7ee7\u7eed\u5904\u7406\u3002")
             return
+        if active_task:
+            user_tasks.pop(session.session_id, None)
         task_state = {"running": True, "queued": 0, "queue": Q.Queue()}
         user_tasks[session.session_id] = task_state
 
@@ -749,12 +1189,18 @@ def handle_message(data):
             while current:
                 done_event = threading.Event()
                 reply_to_message_id = current.get("reply_to_message_id") or _session_reply_anchor(session, current.get("message_id"))
+                # Completion reaction must be added to the user's current message, not to
+                # the session/card anchor. _session_reply_anchor may point at our own
+                # card_message_id after bind_feishu_session_message(), which prevents the
+                # user from receiving the reaction notification.
+                reaction_message_id = current.get("message_id") or reply_to_message_id
+                on_done_notice = lambda mid=reaction_message_id: _add_done_reaction(mid)
                 card = _TaskCard(receive_id, rid_type, reply_to_message_id=reply_to_message_id)
                 card.start()
                 bind_feishu_session_message(session, card.msg_id)
                 if not hasattr(agent, '_turn_end_hooks'):
                     agent._turn_end_hooks = {}
-                agent._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final)
+                agent._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final, on_done_notice)
                 try:
                     session.put_task(current["user_input"], source="feishu", images=current.get("image_paths") or [])
                     start_time = time.time()
@@ -773,6 +1219,8 @@ def handle_message(data):
                     card.fail(f"\u9519\u8bef: {e}")
                 finally:
                     agent._turn_end_hooks.pop(hook_key, None)
+                    with session_lock:
+                        _persist_feishu_sessions()
 
                 with session_lock:
                     if not task_state.get("running", True):
@@ -804,8 +1252,11 @@ def handle_command(open_id, cmd, chat_id=None, session=None):
     agent = session.agent if session is not None else None
     if op == "/stop":
         if session is not None:
-            user_tasks.setdefault(session.session_id, {})["running"] = False
-            agent.abort()
+            task_state = user_tasks.get(session.session_id)
+            if task_state is not None:
+                task_state["running"] = False
+            if agent is not None:
+                agent.abort()
         _send_cmd_response("正在停止...")
     elif op == "/new":
         if agent is None:
@@ -822,6 +1273,9 @@ def handle_command(open_id, cmd, chat_id=None, session=None):
         if len(parts) > 1:
             try:
                 agent.next_llm(int(parts[1]))
+                session.metadata["llm_no"] = agent.llm_no
+                chat_default_llms[_scope_key(open_id, chat_id)] = agent.llm_no
+                _persist_feishu_sessions()
                 return _send_cmd_response(f"✅ 已切换到 [{agent.llm_no}] {agent.get_llm_name()}")
             except Exception:
                 return _send_cmd_response(f"用法: /llm <0-{len(agent.list_llms()) - 1}>")
@@ -854,7 +1308,13 @@ def main():
         print("错误: 请在 mykey.py 或 mykey.json 中配置 fs_app_id 和 fs_app_secret")
         sys.exit(1)
     client = create_client()
-    handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(handle_message).build()
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(handle_message)
+        .register_p2_im_message_reaction_created_v1(lambda data: None)
+        .register_p2_im_message_reaction_deleted_v1(lambda data: None)
+        .build()
+    )
     cli = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
     print("=" * 50 + "\n飞书 Agent 已启动（长连接模式）\n" + f"App ID: {APP_ID}\n等待消息...\n" + "=" * 50)
     cli.start()

@@ -1,0 +1,114 @@
+{
+  "default_minimum_grade": "B",
+  "required_fields": [
+    "type",
+    "task",
+    "status",
+    "summary",
+    "evidence",
+    "rubric_scores"
+  ],
+  "deliverable_types": {
+    "code_change": {
+      "minimum_grade": "B",
+      "required_evidence": ["file", "test"],
+      "rubric": {
+        "correctness": {
+          "weight": 3,
+          "description": "The change solves the stated behavior without known regressions."
+        },
+        "verification": {
+          "weight": 3,
+          "description": "Relevant tests, builds, smoke checks, or manual checks already ran."
+        },
+        "scope_control": {
+          "weight": 2,
+          "description": "The change is narrow, avoids unrelated churn, and respects dirty worktrees."
+        },
+        "maintainability": {
+          "weight": 2,
+          "description": "The implementation follows local patterns and remains easy to review."
+        },
+        "rollback_clarity": {
+          "weight": 1,
+          "description": "The report identifies changed surfaces and how to revert or isolate risk."
+        }
+      }
+    },
+    "ui_change": {
+      "minimum_grade": "B",
+      "required_evidence": ["file", "browser_check"],
+      "rubric": {
+        "task_fit": {
+          "weight": 2,
+          "description": "The UI solves the requested workflow rather than adding decorative surface."
+        },
+        "visual_hierarchy": {
+          "weight": 2,
+          "description": "Layout, spacing, type scale, and information hierarchy are coherent."
+        },
+        "responsive_stability": {
+          "weight": 3,
+          "description": "Desktop/mobile views avoid overlap, overflow, and layout jumps."
+        },
+        "interaction_completeness": {
+          "weight": 2,
+          "description": "Controls, empty states, errors, loading, and expected interactions are present."
+        },
+        "verification": {
+          "weight": 3,
+          "description": "Browser smoke, console check, screenshots, or equivalent evidence exists."
+        }
+      }
+    },
+    "research_report": {
+      "minimum_grade": "B",
+      "required_evidence": ["source", "claim_check"],
+      "rubric": {
+        "answer_relevance": {
+          "weight": 3,
+          "description": "The report directly answers the user's question."
+        },
+        "source_quality": {
+          "weight": 3,
+          "description": "Claims are backed by primary or reliable sources."
+        },
+        "uncertainty_disclosure": {
+          "weight": 2,
+          "description": "Unknowns, assumptions, and time-sensitive facts are clearly marked."
+        },
+        "actionability": {
+          "weight": 2,
+          "description": "The report ends in concrete choices or next actions."
+        }
+      }
+    },
+    "agent_workflow": {
+      "minimum_grade": "B",
+      "required_evidence": ["trace", "smoke"],
+      "rubric": {
+        "role_boundary": {
+          "weight": 3,
+          "description": "TL, leader, and worker responsibilities are explicit and not blurred."
+        },
+        "non_silent_failure": {
+          "weight": 3,
+          "description": "Fallbacks, uncertainty, and failed worker outputs are visible."
+        },
+        "handoff_quality": {
+          "weight": 2,
+          "description": "Each layer passes task, evidence, risk, and acceptance criteria forward."
+        },
+        "observability": {
+          "weight": 2,
+          "description": "The workflow leaves inspectable traces, statuses, and enough debug context."
+        },
+        "calibration": {
+          "weight": 2,
+          "description": "Rubrics or examples exist so judgment does not depend on one model sample."
+        }
+      }
+    }
+  }
+}
+

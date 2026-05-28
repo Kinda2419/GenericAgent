@@ -9,11 +9,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from llmcore import reload_mykeys, LLMSession, ToolClient, ClaudeSession, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession
 from agent_loop import agent_runner_loop
 from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
+from tools.auto_repair import AutoRepairController, handle_repair_command
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
-    TS = open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8').read()
+    with open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8') as f:
+        TS = f.read()
     TOOLS_SCHEMA = json.loads(TS if os.name == 'nt' else TS.replace('powershell', 'bash'))
 load_tool_schema()
 
@@ -39,6 +41,27 @@ def get_system_prompt():
     prompt += get_global_memory()
     return prompt
 
+_RETRYABLE_LLM_TEXT_PATTERNS = (
+    '!!!Error:',
+    '[Error:',
+    'HTTP 408',
+    'HTTP 409',
+    'HTTP 425',
+    'HTTP 429',
+    'HTTP 500',
+    'HTTP 502',
+    'HTTP 503',
+    'HTTP 504',
+    'HTTP 529',
+    'Upstream service temporarily unavailable',
+    '流异常中断',
+)
+
+
+def _looks_retryable_llm_failure(text):
+    text = (text or '').lstrip()
+    return text.startswith(('!!!Error:', '[Error:', '[!!! 流异常中断'))
+
 class GeneraticAgent:
     def __init__(self):
         os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
@@ -49,6 +72,7 @@ class GeneraticAgent:
         self.is_running = False; self.stop_sig = False
         self.llm_no = 0;  self.inc_out = False
         self.handler = None; self.verbose = True
+        self.repair_controller = AutoRepairController(self)
         self.load_llm_sessions()
 
     def load_llm_sessions(self):
@@ -74,6 +98,16 @@ class GeneraticAgent:
                     else: llm_sessions[i] = ToolClient(mixin)
                 except Exception as e: print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
         self.llmclients = llm_sessions
+        default_llm = mykeys.get('default_llm_name', mykeys.get('default_llm'))
+        if default_llm and not getattr(self, '_default_llm_applied', False):
+            try:
+                self.llm_no = int(default_llm)
+            except (TypeError, ValueError):
+                for i, client in enumerate(self.llmclients):
+                    if getattr(getattr(client, 'backend', None), 'name', None) == default_llm:
+                        self.llm_no = i
+                        break
+            self._default_llm_applied = True
         self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
         if oldhistory: self.llmclient.backend.history = oldhistory
     
@@ -122,19 +156,40 @@ class GeneraticAgent:
             return None
         if raw_query.strip() == '/resume':
             return r'扫temp/model_responses/下时间最近的10个文件(除本PID)，读取每个文件content后先replace("\\n","\n").replace("\\r","\r")统一为真换行，再用re.findall(r"<history>\n\[(?:USER|Agent)\].*?</history>", content, re.DOTALL)提取，取每文件最后一个匹配作为该会话内容，按mtime倒序，每个用一句话总结聊了什么让我选择；选定后再简单读该文件末尾作为聊天基础'
+        if raw_query.strip().startswith('/repair'):
+            subcmd = raw_query.strip()[len('/repair'):].strip()
+            handled, response = handle_repair_command(subcmd or 'status')
+            if handled:
+                display_queue.put({'done': response, 'source': 'system'})
+                return None
         return raw_query
 
     def run(self):
         while True:
             task = self.task_queue.get()
             raw_query, source, images, display_queue = task["query"], task["source"], task.get("images") or [], task["output"]
-            raw_query = self._handle_slash_cmd(raw_query, display_queue)
-            if raw_query is None:
-                self.task_queue.task_done(); continue
-            self.is_running = True
-            rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
-            self.history.append(f"[USER]: {rquery}")
-            
+            try:
+                raw_query = self._handle_slash_cmd(raw_query, display_queue)
+                if raw_query is None:
+                    continue
+                self.is_running = True
+                rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
+                self.history.append(f"[USER]: {rquery}")
+                self.repair_controller.reset()
+                self._run_task_with_repair(raw_query, source, images, display_queue)
+            except Exception as e:
+                display_queue.put({'done': f"```\n{format_error(e)}\n```", 'source': source})
+                print(f"Backend Error: {format_error(e)}")
+            finally:
+                self.is_running = self.stop_sig = False
+                self.task_queue.task_done()
+                if self.handler is not None: self.handler.code_stop_signal.append(1)
+
+    def _run_task_with_repair(self, raw_query, source, images, display_queue):
+        """执行任务，出错时自动修复重试"""
+        llm_text_retries = 0
+        max_llm_text_retries = max(0, int(os.environ.get('GA_LLM_TEXT_RETRIES', '2')))
+        while True:
             sys_prompt = get_system_prompt() + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
             if self.handler and 'key_info' in self.handler.working: 
@@ -158,18 +213,34 @@ class GeneraticAgent:
                 if self.inc_out and last_pos < len(full_resp): display_queue.put({'next': full_resp[last_pos:], 'source': source})
                 if '</summary>' in full_resp: full_resp = full_resp.replace('</summary>', '</summary>\n\n')
                 if '</file_content>' in full_resp: full_resp = re.sub(r'<file_content>\s*(.*?)\s*</file_content>', r'\n````\n<file_content>\n\1\n</file_content>\n````', full_resp, flags=re.DOTALL)                
+                if _looks_retryable_llm_failure(full_resp) and llm_text_retries < max_llm_text_retries and not self.stop_sig:
+                    llm_text_retries += 1
+                    try:
+                        self.next_llm()
+                        next_name = self.get_llm_name()
+                    except Exception as retry_err:
+                        display_queue.put({'next': f'\n[LLM Retry] switch failed: {format_error(retry_err)}\n', 'source': source})
+                        next_name = 'current'
+                    retry_notice = f'\n[LLM Retry] retryable provider error detected; retry {llm_text_retries}/{max_llm_text_retries} with {next_name}\n'
+                    display_queue.put({'next': retry_notice, 'summary': f'LLM retry {llm_text_retries}/{max_llm_text_retries}', 'source': source})
+                    continue
                 display_queue.put({'done': full_resp, 'source': source})
                 self.history = handler.history_info
+                return  # 成功完成，退出重试循环
             except Exception as e:
-                print(f"Backend Error: {format_error(e)}")
-                display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source})
-            finally:
-                if self.stop_sig:
-                    print('User aborted the task.')
-                    #with self.task_queue.mutex: self.task_queue.queue.clear()
-                self.is_running = self.stop_sig = False
-                self.task_queue.task_done()
-                if self.handler is not None: self.handler.code_stop_signal.append(1)
+                error_str = format_error(e)
+                print(f"Backend Error: {error_str}")
+                # 自动修复尝试
+                should_retry = self.repair_controller.handle_error(e, raw_query, display_queue)
+                if should_retry and not self.stop_sig:
+                    print(f"[AutoRepair] Retrying... (attempt {self.repair_controller.consecutive_errors})")
+                    continue  # 重试整个任务循环
+                else:
+                    # 修复失败或用户中止，正常结束
+                    display_queue.put({'done': full_resp + f'\n```\n{error_str}\n```', 'source': source})
+                    if self.stop_sig:
+                        print('User aborted the task.')
+                    return
 
     
 
@@ -243,7 +314,7 @@ if __name__ == '__main__':
     parser.add_argument('--task', metavar='IODIR', help='一次性任务模式(文件IO)')
     parser.add_argument('--reflect', metavar='SCRIPT', help='反射模式：加载监控脚本，check()触发时发任务')
     parser.add_argument('--input', help='prompt')
-    parser.add_argument('--llm_no', type=int, default=0)
+    parser.add_argument('--llm_no', type=int)
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--bg', action='store_true', help='popen, print PID, exit')
     args = parser.parse_args()
@@ -259,7 +330,8 @@ if __name__ == '__main__':
         print(p.pid); sys.exit(0)
 
     agent = GeneraticAgent()
-    agent.next_llm(args.llm_no)
+    if args.llm_no is not None:
+        agent.next_llm(args.llm_no)
     agent.verbose = args.verbose
     threading.Thread(target=agent.run, daemon=True).start()
 

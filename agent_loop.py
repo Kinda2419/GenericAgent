@@ -6,6 +6,18 @@ class StepOutcome:
     data: Any
     next_prompt: Optional[str] = None
     should_exit: bool = False
+def repair_tool_name(tool_name, valid_tool_names):
+    if not tool_name:
+        return None
+    valid = set(valid_tool_names or [])
+    normalized = str(tool_name).lower().replace('-', '_').replace(' ', '_')
+    if normalized in valid:
+        return normalized
+    if 2 <= len(normalized) <= 3:
+        matches = [name for name in valid if name.startswith(normalized)]
+        if len(matches) == 1:
+            return matches[0]
+    return None
 def try_call_generator(func, *args, **kwargs):
     ret = func(*args, **kwargs)
     if hasattr(ret, '__iter__') and not isinstance(ret, (str, bytes, dict, list)): ret = yield from ret
@@ -15,7 +27,12 @@ class BaseHandler:
     def tool_before_callback(self, tool_name, args, response): pass
     def tool_after_callback(self, tool_name, args, response, ret): pass
     def turn_end_callback(self, response, tool_calls, tool_results, turn, next_prompt, exit_reason): return next_prompt
+    def valid_tool_names(self):
+        return [name[3:] for name in dir(self) if name.startswith('do_')]
     def dispatch(self, tool_name, args, response, index=0):
+        repaired = repair_tool_name(tool_name, self.valid_tool_names())
+        if repaired and repaired != tool_name:
+            tool_name = repaired
         method_name = f"do_{tool_name}"
         if hasattr(self, method_name):
             args['_index'] = index

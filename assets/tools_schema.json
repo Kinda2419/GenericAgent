@@ -52,6 +52,13 @@
       "switch_tab_id": {"type": "string", "description": "[Optional] Tab ID to switch to before executing"}}}
   }},
   {"type": "function", "function": {
+    "name": "list_dir",
+    "description": "List files and folders in a local directory. Use before reading unknown project folders. Read-only.",
+    "parameters": {"type": "object", "properties": {
+      "path": {"type": "string", "description": "Relative or absolute directory path", "default": "."},
+      "max_items": {"type": "integer", "description": "Maximum entries to return", "default": 200}}}
+  }},
+  {"type": "function", "function": {
     "name": "update_working_checkpoint",
     "description": "Short-term working notepad, auto-injected each turn to prevent info loss in long tasks. Call during early/mid stages, not at end. When: (1) after reading SOP, store user needs & key constraints (skip for simple 1-2 step tasks); (2) before subtask switch or context flush; (3) after repeated failures, re-read SOP and must store new findings; (4) on new task, update content, clear old progress but keep valid constraints.\n\nDon't call: simple tasks (1-2 steps), task completed (use long-term memory tool)",
     "parameters": {"type": "object", "properties": {
