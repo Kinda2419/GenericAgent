@@ -13,7 +13,7 @@ from ga import GenericAgentHandler, smart_format, get_global_memory, format_erro
 script_dir = os.path.dirname(os.path.abspath(__file__))
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
-    TS = open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8').read()
+    TS = open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8-sig').read()
     TOOLS_SCHEMA = json.loads(TS if os.name == 'nt' else TS.replace('powershell', 'bash'))
 load_tool_schema()
 
@@ -74,6 +74,16 @@ class GeneraticAgent:
                     else: llm_sessions[i] = ToolClient(mixin)
                 except Exception as e: print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
         self.llmclients = llm_sessions
+        default_llm = mykeys.get('default_llm_name', mykeys.get('default_llm'))
+        if default_llm and not getattr(self, '_default_llm_applied', False):
+            try:
+                self.llm_no = int(default_llm)
+            except (TypeError, ValueError):
+                for i, client in enumerate(self.llmclients):
+                    if getattr(getattr(client, 'backend', None), 'name', None) == default_llm:
+                        self.llm_no = i
+                        break
+            self._default_llm_applied = True
         self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
         if oldhistory: self.llmclient.backend.history = oldhistory
     
@@ -162,8 +172,10 @@ class GeneraticAgent:
                 display_queue.put({'done': full_resp, 'source': source})
                 self.history = handler.history_info
             except Exception as e:
-                print(f"Backend Error: {format_error(e)}")
-                display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source})
+                error_info = format_error(e)
+                print(f"Backend Error: {error_info}")
+                error_text = (full_resp + '\n\n' if full_resp else '') + f'```\n{error_info}\n```'
+                display_queue.put({'error': error_text, 'error_info': error_info, 'source': source})
             finally:
                 if self.stop_sig:
                     print('User aborted the task.')
@@ -278,6 +290,8 @@ if __name__ == '__main__':
             while 'done' not in (item := dq.get(timeout=120)): 
                 if 'next' in item and random.random() < 0.95:  # 概率写一次中间结果
                     with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
+                if 'error' in item:
+                    raise RuntimeError(item.get('error_info') or item.get('error'))
             with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
             consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
             for _ in range(300):  # 等reply.txt，10分钟超时
@@ -304,7 +318,9 @@ if __name__ == '__main__':
             print(f'[Reflect] triggered: {task[:80]}')
             dq = agent.put_task(task, source='reflect')
             try:
-                while 'done' not in (item := dq.get(timeout=120)): pass
+                while 'done' not in (item := dq.get(timeout=120)):
+                    if 'error' in item:
+                        raise RuntimeError(item.get('error_info') or item.get('error'))
                 result = item['done']
                 print(result)
             except Exception as e:
@@ -329,6 +345,9 @@ if __name__ == '__main__':
                 while True:
                     item = dq.get()
                     if 'next' in item: print(item['next'], end='', flush=True)
+                    if 'error' in item:
+                        print('\n' + item.get('error', item.get('error_info', 'Unknown error')))
+                        break
                     if 'done' in item: print(); break
             except KeyboardInterrupt:
                 agent.abort()

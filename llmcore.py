@@ -1,18 +1,20 @@
-import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid
+import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, importlib.util, uuid
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4())
 
 def _load_mykeys():
     global _mykey_path
-    try:
-        import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.py')
+    if os.path.exists(p):
+        _mykey_path = p
+        spec = importlib.util.spec_from_file_location(f'_ga_mykey_{os.getpid()}_{time.time_ns()}', p)
+        mykey = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mykey)
         return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
-    except ImportError: pass
     _mykey_path = p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
     if not os.path.exists(p): raise Exception('[ERROR] mykey.py or mykey.json not found, please create one from mykey_template.')
     with open(p, encoding='utf-8') as f: return json.load(f)
-
 _mykey_path = _mykey_mtime = None
 def reload_mykeys():
     global _mykey_mtime
@@ -30,11 +32,11 @@ def __getattr__(name):  # once guard in PEP 562
     if name == 'mykeys': return reload_mykeys()[0]
     raise AttributeError(f"module 'llmcore' has no attribute {name}")
 
-def compress_history_tags(messages, keep_recent=10, max_len=800, force=False):
+def compress_history_tags(messages, keep_recent=10, max_len=800, force=False, interval=5):
     """Compress <thinking>/<tool_use>/<tool_result> tags in older messages to save tokens."""
     compress_history_tags._cd = getattr(compress_history_tags, '_cd', 0) + 1
     if force: compress_history_tags._cd = 0
-    if compress_history_tags._cd % 5 != 0: return messages
+    if compress_history_tags._cd % interval != 0: return messages
     _before = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
     _pats = {tag: re.compile(rf'(<{tag}>)([\s\S]*?)(</{tag}>)') for tag in ('thinking', 'think', 'tool_use', 'tool_result')}
     _hist_pat = re.compile(r'<(history|key_info|earlier_context)>[\s\S]*?</\1>')
@@ -87,19 +89,20 @@ def safeprint(*argv):
     except OSError: pass
 print = safeprint
 
-def trim_messages_history(history, context_win):
-    compress_history_tags(history)
-    cost = sum(len(json.dumps(m, ensure_ascii=False)) for m in history) 
-    print(f'[Debug] Current context: {cost} chars, {len(history)} messages.')
-    if cost > context_win * 3: 
-        compress_history_tags(history, keep_recent=4, force=True)   # trim breaks cache, so compress more btw
-        target = context_win * 3 * 0.6
-        while len(history) > 5 and cost > target:
-            history.pop(0)
-            while history and history[0].get('role') != 'user': history.pop(0)
-            if history and history[0].get('role') == 'user': history[0] = _sanitize_leading_user_msg(history[0])
-            cost = sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
-        print(f'[Debug] Trimmed context, current: {cost} chars, {len(history)} messages.')
+def trim_messages_history(history, sess):
+    cap = sess.context_win * 3
+    target = int(cap * getattr(sess, 'trim_keep_rate', 0.6))
+    def cost(): return sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
+    compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 5))
+    print(f'[Debug] Current context: {cost()} chars, {len(history)} messages.')
+    if cost() <= cap: return
+    compress_history_tags(history, keep_recent=4, force=True)
+    if cost() <= target: return
+    while len(history) > 9 and cost() > target:
+        history.pop(0)
+        while history and history[0].get('role') != 'user': history.pop(0)
+        if history and history[0].get('role') == 'user': history[0] = _sanitize_leading_user_msg(history[0])
+    print(f'[Debug] Trimmed context, current: {cost()} chars, {len(history)} messages.')
 
 def auto_make_url(base, path):
     b, p = base.rstrip('/'), path.strip('/')
@@ -205,13 +208,13 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
     """
     content_text = ""
     if api_mode == "responses":
-        seen_delta = False; fc_buf = {}; current_fc_idx = None
+        seen_delta = False; fc_buf = {}; current_fc_idx = None; completed = False; done_marker = False
         for line in resp_lines:
             if not line: continue
             line = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else line
             if not line.startswith("data:"): continue
             data_str = line[5:].lstrip()
-            if data_str == "[DONE]": break
+            if data_str == "[DONE]": done_marker = True; break
             try: evt = json.loads(data_str)
             except: continue
             etype = evt.get("type", "")
@@ -241,7 +244,10 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             elif etype == "response.completed":
                 usage = evt.get("response", {}).get("usage", {})
                 _record_usage(usage, api_mode)
+                completed = True
                 break
+        if not (completed or done_marker):
+            raise requests.ConnectionError("OpenAI responses stream ended before response.completed")
         blocks = []
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(fc_buf):
@@ -254,16 +260,17 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
         return blocks
     else:
         tc_buf = {}  # index -> {id, name, args}
-        reasoning_text = ""
+        reasoning_text = ""; done_marker = False; finish_reason = None
         for line in resp_lines:
             if not line: continue
             line = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else line
             if not line.startswith("data:"): continue
             data_str = line[5:].lstrip()
-            if data_str == "[DONE]": break
+            if data_str == "[DONE]": done_marker = True; break
             try: evt = json.loads(data_str)
             except: continue
             ch = (evt.get("choices") or [{}])[0]
+            finish_reason = ch.get("finish_reason") or finish_reason
             delta = ch.get("delta") or {}
             if delta.get("reasoning_content"):
                 reasoning_text += delta["reasoning_content"]
@@ -280,6 +287,8 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 if tc.get("id") and not tc_buf[idx]["id"]: tc_buf[idx]["id"] = tc["id"]
             usage = evt.get("usage")
             if usage: _record_usage(usage, api_mode)
+        if not (done_marker or finish_reason):
+            raise requests.ConnectionError("OpenAI chat stream ended before completion marker")
         blocks = []
         if reasoning_text: blocks.append({"type": "thinking", "thinking": reasoning_text})
         if content_text: blocks.append({"type": "text", "text": content_text})
@@ -296,12 +305,14 @@ def _record_usage(usage, api_mode):
     if not usage: return
     if api_mode == 'responses':
         cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
-        inp = usage.get("input_tokens", 0)
+        inp = usage.get("input_tokens", 0); out = usage.get("output_tokens", 0)
         print(f"[Cache] input={inp} cached={cached}")
+        if out: print(f"[Output] tokens={out}")
     elif api_mode == 'chat_completions':
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-        inp = usage.get("prompt_tokens", 0)
+        inp = usage.get("prompt_tokens", 0); out = usage.get("completion_tokens", 0)
         print(f"[Cache] input={inp} cached={cached}")
+        if out: print(f"[Output] tokens={out}")
     elif api_mode == 'messages':
         ci, cr, inp = usage.get("cache_creation_input_tokens", 0), usage.get("cache_read_input_tokens", 0), usage.get("input_tokens", 0)
         print(f"[Cache] input={inp} creation={ci} read={cr}")
@@ -349,40 +360,75 @@ def _stamp_oai_cache_markers(messages, model):
             c = list(c); c[-1] = dict(c[-1], cache_control={'type': 'ephemeral'})
             messages[idx] = {**messages[idx], 'content': c}
 
-def _stream_with_retry(sess, url, headers, payload, parse_fn):
+def _safe_url_label(url):
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        return f"{u.netloc}{u.path}"
+    except Exception:
+        return str(url).split("?", 1)[0][:120]
+
+def _blocks_are_error(blocks):
+    return isinstance(blocks, list) and len(blocks) == 1 and _is_retryable_llm_error(blocks[0].get("text", ""))
+
+def _is_retryable_llm_error(text):
+    text = str(text or "")
+    stripped = text.lstrip()
+    markers = (
+        "[!!! Stream interrupted:",
+        "[!!! 流异常中断",
+        "ChunkedEncodingError",
+        "Response ended prematurely",
+        "OpenAI responses stream ended before response.completed",
+        "OpenAI chat stream ended before completion marker",
+    )
+    return stripped.startswith(("!!!Error:", "[Error:")) or any(marker in text for marker in markers)
+
+def _stream_with_retry(sess, url, headers, payload, parse_fn, request_stream=None, emit_final_error=True):
     _RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
         return max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
+    req_stream = sess.stream if request_stream is None else request_stream
     for attempt in range(sess.max_retries + 1):
-        streamed = False
+        streamed = False; chunks = []
         try:
-            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
+            with requests.post(url, headers=headers, json=payload, stream=req_stream,
                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 if r.status_code >= 400:
                     if r.status_code in _RETRYABLE and attempt < sess.max_retries:
                         d = _delay(r, attempt)
-                        print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                        print(f"[LLM Retry] HTTP {r.status_code} from {_safe_url_label(url)}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
                         time.sleep(d); continue
                     try: body = r.text.strip()[:500]
                     except: body = ""
                     err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
-                    yield err; return [{"type": "text", "text": err}]
+                    if emit_final_error: yield err
+                    return [{"type": "text", "text": err}]
                 gen = parse_fn(r)
                 try:
-                    while True: streamed = True; yield next(gen)
-                except StopIteration as e: return e.value or []
+                    while True:
+                        chunk = next(gen)
+                        streamed = True
+                        chunks.append(chunk)
+                except StopIteration as e:
+                    if not e.value and not streamed: raise requests.ConnectionError("empty response")
+                    for chunk in chunks: yield chunk
+                    return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
             err = f"!!!Error: {type(e).__name__}"
             if attempt < sess.max_retries:
                 d = _delay(None, attempt)
-                print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                yield err; time.sleep(d); continue
-            yield err; return [{"type": "text", "text": err}]
+                print(f"[LLM Retry] {type(e).__name__} from {_safe_url_label(url)}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                if emit_final_error: yield err
+                time.sleep(d); continue
+            if emit_final_error: yield err
+            return [{"type": "text", "text": err}]
         except Exception as e:
             err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
-            yield err; return [{"type": "text", "text": err}]
+            if emit_final_error: yield err
+            return [{"type": "text", "text": err}]
 
 def _openai_stream(sess, messages):
     model, api_mode = sess.model, sess.api_mode
@@ -410,7 +456,24 @@ def _openai_stream(sess, messages):
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
     if sess.service_tier: payload["service_tier"] = sess.service_tier
     parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
-    return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
+    use_stream_fallback = sess.stream and getattr(sess, "stream_fallback", True)
+    blocks = yield from _stream_with_retry(sess, url, headers, payload, parse_fn, emit_final_error=not use_stream_fallback)
+    if use_stream_fallback and _blocks_are_error(blocks):
+        fallback_payload = dict(payload)
+        fallback_payload["stream"] = False
+        fallback_payload.pop("stream_options", None)
+        fallback_headers = dict(headers)
+        fallback_headers["Accept"] = "application/json"
+        print(f"[LLM Fallback] Stream failed on {_safe_url_label(url)}; retrying once with stream=False")
+        blocks = yield from _stream_with_retry(
+            sess,
+            url,
+            fallback_headers,
+            fallback_payload,
+            lambda r: _parse_openai_json(r.json(), api_mode),
+            request_stream=False,
+        )
+    return blocks
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
     if api_mode == "responses":
@@ -479,9 +542,8 @@ def _msgs_claude2oai(messages):
             m = {"role": "assistant"}
             if reasoning: m["reasoning_content"] = reasoning
             if text_parts: m["content"] = text_parts
-            else: m["content"] = ""
+            elif not tool_calls: m["content"] = "."
             if tool_calls: m["tool_calls"] = tool_calls
-            if not text_parts and not tool_calls and reasoning: m["content"] = "."
             result.append(m)
         elif role == "user":
             text_parts = []
@@ -511,19 +573,21 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        self.context_win = cfg.get('context_win', 28000)
-        self.history = []
-        self.lock = threading.Lock()
-        self.system = ""
+        default_context_win = 30000
+        if 'deepseek' in self.model.lower():
+            default_context_win = 70000; self.cut_msg_interval = 25; self.trim_keep_rate = 0.3
+        self.context_win = cfg.get('context_win', default_context_win)
+        self.history = []; self.lock = threading.Lock(); self.system = ""
         self.name = cfg.get('name', self.model)
-        proxy = cfg.get('proxy')
+        proxy = cfg.get('proxy'); 
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.max_retries = max(0, int(cfg.get('max_retries', 4)))
         self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 30) if self.stream else (10, 240)
-        self.connect_timeout = max(1, int(cfg.get('timeout', default_ct)))
+        self.connect_timeout = max(1, int(cfg.get('connect_timeout', cfg.get('timeout', default_ct))))
         self.read_timeout = max(5, int(cfg.get('read_timeout', default_rt)))
+        self.stream_fallback = cfg.get('stream_fallback', True)
         def _enum(key, valid):
             v = cfg.get(key); v = None if v is None else str(v).strip().lower()
             return v if not v or v in valid else print(f"[WARN] Invalid {key} {v!r}, ignored.")
@@ -551,7 +615,7 @@ class BaseSession:
         def _ask_gen():
             with self.lock:
                 self.history.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
-                trim_messages_history(self.history, self.context_win)
+                trim_messages_history(self.history, self)
                 messages = self.make_messages(self.history)
             content_blocks = None; content = ''
             gen = self.raw_ask(messages)
@@ -563,7 +627,7 @@ class BaseSession:
                 if block.get('type', '') == 'tool_use':
                     tu = {'name': block.get('name', ''), 'arguments': block.get('input', {})}
                     yield f'<tool_use>{json.dumps(tu, ensure_ascii=False)}</tool_use>'
-            if not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
+            if content.strip() and not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
         return _ask_gen() if self.stream else ''.join(list(_ask_gen()))
 
 def _keep_claude_block(b): return not isinstance(b, dict) or b.get("type") != "thinking" or b.get("signature")
@@ -586,6 +650,7 @@ def _ensure_thinking_blocks(messages, model):
 
 class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
+        messages = _fix_messages(messages)
         if self.max_tokens is None: self.max_tokens = 8192
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31"}
         payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
@@ -604,7 +669,7 @@ class ClaudeSession(BaseSession):
 
 class LLMSession(BaseSession):
     def raw_ask(self, messages): return (yield from _openai_stream(self, messages))
-    def make_messages(self, raw_list): return _msgs_claude2oai(raw_list)
+    def make_messages(self, raw_list): return _msgs_claude2oai(_fix_messages(raw_list))
 
 def _fix_messages(messages):
     """修复 messages 符合 Claude API：交替、tool_use/tool_result 配对"""
@@ -635,9 +700,11 @@ class NativeClaudeSession(BaseSession):
         self._device_id = uuid.uuid4().hex + uuid.uuid4().hex[:32]
         self.tools = None
     def raw_ask(self, messages):
-        messages = _ensure_thinking_blocks(_drop_unsigned_thinking(_fix_messages(messages)), self.model)
         if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
+        messages = _fix_messages(messages)
+        if 'claude' in model.lower(): messages = _drop_unsigned_thinking(messages)
+        messages = _ensure_thinking_blocks(messages, self.model)
         beta_parts = ["claude-code-20250219", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "prompt-caching-scope-2026-01-05"]
         if "[1m]" in model.lower():
             beta_parts.insert(1, "context-1m-2025-08-07"); model = model.replace("[1m]", "").replace("[1M]", "")
@@ -671,7 +738,7 @@ class NativeClaudeSession(BaseSession):
         assert type(msg) is dict
         with self.lock:
             self.history.append(msg)
-            trim_messages_history(self.history, self.context_win)
+            trim_messages_history(self.history, self)
             messages = [{"role": m["role"], "content": list(m["content"])} for m in self.history]
         content_blocks = None
         gen = self.raw_ask(messages)
@@ -734,16 +801,26 @@ class ToolClient:
         self.last_tools = ''
         self.name = self.backend.name
         self.total_cd_tokens = 0
+        self.log_path = None
 
     def chat(self, messages, tools=None):
+        tools = json.loads(json.dumps(tools, ensure_ascii=False)) if tools else tools
+        for t in tools or []:
+            f = t.get('function', {})
+            if f.get('name') == 'file_write':
+                props = f.get('parameters', {}).get('properties', {})
+                props.pop('content', None)
+                extra = '. Content must be placed in <file_content> tags in reply body, not in args'
+                if extra not in f.get('description', ''): f['description'] = f.get('description', '') + extra
+                break
         full_prompt = self._build_protocol_prompt(messages, tools)
         print("Full prompt length:", len(full_prompt), 'chars')
         gen = self.backend.ask(full_prompt)
-        _write_llm_log('Prompt', full_prompt)
+        _write_llm_log('Prompt', full_prompt, self.log_path)
         raw_text = ''
         for chunk in gen:
             raw_text += chunk; yield chunk
-        _write_llm_log('Response', raw_text)
+        _write_llm_log('Response', raw_text, self.log_path)
         return self._parse_mixed_response(raw_text)
 
     def _prepare_tool_instruction(self, tools):
@@ -860,10 +937,10 @@ def _ensure_text_block(blocks):
     blocks.insert(1, {"type": "text", "text": txt})
     return txt
 
-def _write_llm_log(label, content):
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp/model_responses')
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f'model_responses_{os.getpid()}.txt')
+def _write_llm_log(label, content, log_path=None):
+    if not log_path:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'temp/model_responses/model_responses_{os.getpid()}.txt')
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(log_path, 'a', encoding='utf-8', errors='replace') as f:
         f.write(f"=== {label} === {ts}\n{content}\n\n")
@@ -894,7 +971,6 @@ class MixinSession:
         for s in self._sessions: s.max_retries = 0
         self._orig_raw_asks = [s.raw_ask for s in self._sessions]
         self._sessions[0].raw_ask = self._raw_ask
-        self.model = getattr(self._sessions[0], 'model', None)
         self._cur_idx, self._switched_at = 0, 0.0
     def __getattr__(self, name): return getattr(self._sessions[0], name)
     _BROADCAST_ATTRS = frozenset({'system', 'tools', 'temperature', 'max_tokens', 'reasoning_effort', 'history'})
@@ -906,12 +982,14 @@ class MixinSession:
         else: object.__setattr__(self, name, value)
     @property
     def primary(self): return self._sessions[0]
+    @property
+    def model(self): return getattr(self._sessions[self._cur_idx], 'model', None)
     def _pick(self):
         if self._cur_idx and time.time() - self._switched_at > self._spring_sec: self._cur_idx = 0
         return self._cur_idx
     def _raw_ask(self, *args, **kwargs):
         base, n = self._pick(), len(self._sessions)
-        test_error = lambda x: isinstance(x, str) and x.lstrip().startswith(('!!!Error:', '[Error:'))
+        test_error = _is_retryable_llm_error
         for attempt in range(self._retries + 1):
             idx = (base + attempt) % n
             gen = self._orig_raw_asks[idx](*args, **kwargs)
@@ -923,7 +1001,8 @@ class MixinSession:
                     if not yielded and test_error(chunk): continue
                     yield chunk; yielded = True
             except StopIteration as e: return_val = e.value or []
-            is_err = test_error(last_chunk)
+            block_text = "\n".join(str(b.get("text", "")) for b in return_val if isinstance(b, dict)) if isinstance(return_val, list) else ""
+            is_err = test_error(last_chunk) or test_error(block_text)
             if not is_err:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
                 elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:
@@ -959,6 +1038,7 @@ class NativeToolClient:
         self.backend.system = self._thinking_prompt()
         self.name = self.backend.name
         self._pending_tool_ids = []
+        self.log_path = None
     def set_system(self, extra_system):
         combined = f"{extra_system}\n\n{self._thinking_prompt()}" if extra_system else self._thinking_prompt()
         if combined != self.backend.system: print(f"[Debug] Updated system prompt, length {len(combined)} chars.")
@@ -983,13 +1063,33 @@ class NativeToolClient:
         for tid in self._pending_tool_ids:
             if tid not in tr_id_set: tool_result_blocks.append({"type": "tool_result", "tool_use_id": tid, "content": ""})
         self._pending_tool_ids = []
-        merged = {"role": "user", "content": tool_result_blocks + combined_content}
-        _write_llm_log('Prompt', json.dumps(merged, ensure_ascii=False, indent=2))
+        # Filter whitespace-only text blocks that cause 400 on strict API proxies
+        filtered_content = [c for c in combined_content if c.get("text", "").strip()]
+        final_content = tool_result_blocks + filtered_content
+        if not final_content: final_content = [{"type": "text", "text": "."}]
+        merged = {"role": "user", "content": final_content}
+        _write_llm_log('Prompt', json.dumps(merged, ensure_ascii=False, indent=2), self.log_path)
         gen = self.backend.ask(merged)
         try:
             while True: 
                 chunk = next(gen); yield chunk
         except StopIteration as e: resp = e.value
-        if resp: _write_llm_log('Response', resp.raw)
+        if resp: _write_llm_log('Response', resp.raw, self.log_path)
         if resp and hasattr(resp, 'tool_calls') and resp.tool_calls: self._pending_tool_ids = [tc.id for tc in resp.tool_calls]
         return resp
+
+def resolve_session(cfg_name):
+    cfg = reload_mykeys()[0].get(cfg_name)
+    if not cfg: raise ValueError(f"Config '{cfg_name}' not in mykey")
+    if 'native' in cfg_name: return (NativeClaudeSession if 'claude' in cfg_name else NativeOAISession)(cfg=cfg)
+    if 'claude' in cfg_name: return ClaudeSession(cfg=cfg)
+    return LLMSession(cfg=cfg) if 'oai' in cfg_name else None
+
+def resolve_client(cfg_name):
+    s = resolve_session(cfg_name)
+    return (NativeToolClient(s) if isinstance(s, (NativeClaudeSession, NativeOAISession)) else ToolClient(s)) if s else None
+
+def fast_ask(prompt, cfg_name):
+    sess = resolve_session(cfg_name)
+    if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")
+    return "".join(sess.raw_ask([{"role": "user", "content": prompt}]))

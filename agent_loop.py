@@ -1,4 +1,4 @@
-import json, re, os
+﻿import json, re, os
 from dataclasses import dataclass
 from typing import Any, Optional
 @dataclass
@@ -6,6 +6,33 @@ class StepOutcome:
     data: Any
     next_prompt: Optional[str] = None
     should_exit: bool = False
+_TOOL_ALIASES = {
+    "view_file": "file_read", "read_file": "file_read", "open_file": "file_read",
+    "edit_file": "file_patch", "modify_file": "file_patch", "replace_in_file": "file_patch",
+    "write_file": "file_write", "create_file": "file_write", "save_file": "file_write",
+    "run_code": "code_run", "execute_code": "code_run", "run_script": "code_run", "execute": "code_run",
+    "browser_scan": "web_scan", "scan_page": "web_scan", "get_page": "web_scan",
+    "run_js": "web_execute_js", "execute_js": "web_execute_js", "browser_execute_js": "web_execute_js",
+    "ls": "list_dir", "dir": "list_dir", "list_files": "list_dir", "list_directory": "list_dir",
+    "ask": "ask_user", "prompt_user": "ask_user", "human_input": "ask_user",
+}
+
+def repair_tool_name(tool_name, valid_tool_names):
+    if not tool_name:
+        return None
+    valid = set(valid_tool_names or [])
+    normalized = str(tool_name).lower().replace('-', '_').replace(' ', '_')
+    if normalized in valid:
+        return normalized
+    alias = _TOOL_ALIASES.get(normalized)
+    if alias and alias in valid:
+        print(f"[tool_name_repair] {tool_name!r} -> {alias!r}")
+        return alias
+    if 2 <= len(normalized) <= 3:
+        matches = [name for name in valid if name.startswith(normalized)]
+        if len(matches) == 1:
+            return matches[0]
+    return None
 def try_call_generator(func, *args, **kwargs):
     ret = func(*args, **kwargs)
     if hasattr(ret, '__iter__') and not isinstance(ret, (str, bytes, dict, list)): ret = yield from ret
@@ -15,7 +42,12 @@ class BaseHandler:
     def tool_before_callback(self, tool_name, args, response): pass
     def tool_after_callback(self, tool_name, args, response, ret): pass
     def turn_end_callback(self, response, tool_calls, tool_results, turn, next_prompt, exit_reason): return next_prompt
+    def valid_tool_names(self):
+        return [name[3:] for name in dir(self) if name.startswith('do_')]
     def dispatch(self, tool_name, args, response, index=0):
+        repaired = repair_tool_name(tool_name, self.valid_tool_names())
+        if repaired and repaired != tool_name:
+            tool_name = repaired
         method_name = f"do_{tool_name}"
         if hasattr(self, method_name):
             args['_index'] = index
@@ -25,8 +57,8 @@ class BaseHandler:
             return ret
         elif tool_name == 'bad_json': return StepOutcome(None, next_prompt=args.get('msg', 'bad_json'), should_exit=False)
         else:
-            yield f"未知工具: {tool_name}\n"
-            return StepOutcome(None, next_prompt=f"未知工具 {tool_name}", should_exit=False)
+            valid = ', '.join(sorted(self.valid_tool_names()))
+            return StepOutcome({"status": "error", "msg": f"未知工具 '{tool_name}'。可用工具: {valid}"})
 
 def json_default(o): return list(o) if isinstance(o, set) else str(o)
 def exhaust(g):
