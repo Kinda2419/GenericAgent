@@ -32,6 +32,7 @@ mykey.py
 tasks/
 
 *.zip
+*.exe
 
 memory/*
 !memory/memory_management_sop.md
@@ -47,6 +48,7 @@ memory/*
 !memory/L4_raw_sessions/
 memory/L4_raw_sessions/*
 !memory/L4_raw_sessions/compress_session.py
+!memory/L4_raw_sessions/salient_mining_sop.md
 
 # ljqCtrl related tools
 !memory/ljqCtrl.py
@@ -63,7 +65,10 @@ memory/L4_raw_sessions/*
 !memory/vue3_component_sop.md
 
 # Subagent SOP
-!memory/subagent_sop.md
+!memory/subagent.md
+
+# Incubator SOP
+!memory/incubator_sop.md
 
 # Supervisor SOP
 !memory/supervisor_sop.md
@@ -73,6 +78,13 @@ memory/L4_raw_sessions/*
 
 # Goal Mode SOP
 !memory/goal_mode_sop.md
+
+# Goal Hive Mode SOP
+!memory/goal_hive_sop.md
+!memory/goal_hive_master_duty.md
+
+# Morphling SOP
+!memory/morphling_sop.md
 
 # Skill Search SOP
 !memory/skill_search/
@@ -96,6 +108,9 @@ memory/L4_raw_sessions/*
 
 # Code Review Principles
 !memory/code_review_principles.md
+
+# Review Mode SOP
+!memory/review_sop.md
 
 # Visual Studio
 .vs/
