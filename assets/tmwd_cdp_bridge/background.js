@@ -21,6 +21,16 @@ async function handleExtMessage(msg, sender) {
   if (msg.cmd === 'batch') return await handleBatch(msg, sender);
   if (msg.cmd === 'tabs') {
     try {
+      if (msg.method === 'create') {
+        const tab = await chrome.tabs.create({
+          url: msg.url,
+          active: msg.active !== undefined ? msg.active : false,
+          index: msg.index,
+          windowId: msg.windowId,
+          openerTabId: msg.openerTabId
+        });
+        return { ok: true, data: { id: tab.id, url: tab.url, title: tab.title } };
+      }
       if (msg.method === 'switch') {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
@@ -51,6 +61,18 @@ async function handleExtMessage(msg, sender) {
         return { ok: true };
       }
       return { ok: false, error: 'Unknown method: ' + msg.method };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+  if (msg.cmd === 'contentSettings') {
+    try {
+      const type = msg.type || 'automaticDownloads';
+      const setting = msg.setting || 'allow';
+      const pattern = msg.pattern || '<all_urls>';
+      await chrome.contentSettings[type].set({
+        primaryPattern: pattern,
+        setting: setting
+      });
+      return { ok: true };
     } catch (e) { return { ok: false, error: e.message }; }
   }
   return { ok: false, error: 'Unknown cmd: ' + msg.cmd };
